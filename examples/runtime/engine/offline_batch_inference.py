@@ -13,7 +13,7 @@ def main():
     sampling_params = {"temperature": 0.8, "top_p": 0.95}
 
     # Create an LLM.
-    llm = sgl.Engine(model_path="meta-llama/Meta-Llama-3.1-8B-Instruct")
+    llm = sgl.Engine(model_path="/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/", disable_cuda_graph=True)
 
     outputs = llm.generate(prompts, sampling_params)
     # Print the outputs.
