@@ -174,6 +174,29 @@ async def health():
     return Response(status_code=200, content="OK")
 
 
+@app.get("/v1/models")
+async def v1_models():
+    """
+    Returns the server arguments of the first worker.
+    """
+    first_worker = router.worker_list[0]
+
+    max_retries = 5
+
+    for _ in range(max_retries):
+        try:
+            res = await first_worker.client.get("/v1/models")
+            res.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Error getting server args: {e}")
+            await is_healthy_or_remove(first_worker)
+            continue
+        return Response(content=res.content, media_type="application/json")
+    return Response(
+        status_code=500,
+        content=f"Failed to get server args after {max_retries} retries",
+    )
+
 @app.get("/get_server_args")
 async def get_server_args():
     """
