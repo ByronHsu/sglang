@@ -2,6 +2,8 @@ use actix_web::{get, post, web, App, HttpServer, HttpResponse, HttpRequest, Resp
 use bytes::Bytes;
 use clap::Parser;
 use rand::seq::SliceRandom;
+use futures_util::StreamExt;
+use actix_web::http::header::{HeaderValue, CONTENT_TYPE};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -93,8 +95,13 @@ async fn generate(
         Some(url) => url,
         None => return HttpResponse::InternalServerError().finish(),
     };
-    // Use the shared client
-    match data.client
+
+    // Check if client requested streaming
+    let is_stream = serde_json::from_slice::<serde_json::Value>(&body)
+        .map(|v| v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false))
+        .unwrap_or(false);
+
+    let res = match data.client
         .post(&format!("{}/generate", worker_url))
         .header(
             "Content-Type", 
@@ -107,19 +114,54 @@ async fn generate(
         .send()
         .await 
     {
-        Ok(res) => {
-            let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
-        
-            // print the status
-            println!("Worker URL: {}, Status: {}", worker_url, status);
-            match res.bytes().await {
-                Ok(body) => HttpResponse::build(status).body(body.to_vec()),
-                Err(_) => HttpResponse::InternalServerError().finish(),
-            }
-        },
-        Err(_) => HttpResponse::InternalServerError().finish(),
+        Ok(res) => res,
+        Err(_) => return HttpResponse::InternalServerError().finish(),
+    };
+
+    let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
+        .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+    if !is_stream {
+        match res.bytes().await {
+            Ok(body) => HttpResponse::build(status).body(body.to_vec()),
+            Err(_) => HttpResponse::InternalServerError().finish(),
+        } 
+    } else {
+        HttpResponse::build(status)
+            .insert_header((CONTENT_TYPE, HeaderValue::from_static("text/event-stream")))
+            .streaming(res.bytes_stream().map(|b| match b {
+                Ok(b) => Ok::<_, actix_web::Error>(b),
+                Err(_) => Err(actix_web::Error::from(actix_web::error::ErrorInternalServerError("Failed to read stream"))),
+            }))
     }
+
+    // Use the shared client
+    // match data.client
+    //     .post(&format!("{}/generate", worker_url))
+    //     .header(
+    //         "Content-Type", 
+    //         req.headers()
+    //             .get("Content-Type")
+    //             .and_then(|h| h.to_str().ok())
+    //             .unwrap_or("application/json")
+    //     )
+    //     .body(body.to_vec())
+    //     .send()
+    //     .await 
+    // {
+    //     Ok(res) => {
+    //         let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
+    //         .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
+        
+    //         // print the status
+    //         println!("Worker URL: {}, Status: {}", worker_url, status);
+    //         match res.bytes().await {
+    //             Ok(body) => HttpResponse::build(status).body(body.to_vec()),
+    //             Err(_) => HttpResponse::InternalServerError().finish(),
+    //         }
+    //     },
+    //     Err(_) => HttpResponse::InternalServerError().finish(),
+    // }
 
 }
 
