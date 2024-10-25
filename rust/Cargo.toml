@@ -1,7 +1,15 @@
 [package]
-name = "hello-world"
-version = "0.1.0"
+name = "sglang-router"
+version = "0.0.0"
 edition = "2021"
+
+[[bin]]
+name = "router"
+path = "src/main.rs"
+
+[lib]
+name = "router"
+crate-type = ["cdylib"]
 
 [dependencies]
 actix-web = "4.0"
@@ -12,3 +20,4 @@ rand = "0.8.5"
 reqwest = { version = "0.12.8", features = ["stream"] }
 futures-util = "0.3"
 serde_json = "=1.0.1"
+pyo3 = { version = "0.22.5", features = ["extension-module"] }
