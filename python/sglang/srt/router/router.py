@@ -67,6 +67,20 @@ class RoundRobinRouter(BaseRouter):
         worker = self.worker_list[self.idx]
         return worker
 
+class ApproxTreeRouter(BaseRouter):
+    def __init__(self, server_urls: List[str]):
+        super().__init__(server_urls)
+    
+    def calc_priority(self):
+        """
+        1. Match with each radix tree and select the highest match
+        2. If the match is above the threshold, send the request to the worker, if not send the request with the shortest request queue
+        3. Before the request is sent, insert the request into the radix tree
+        4. After the request returned, remove the request from the radix tree and insert the cached response into the radix tree
+        """
+        
+        ...
+
 
 # Extend your router here
 class RoutingPolicy(Enum):
