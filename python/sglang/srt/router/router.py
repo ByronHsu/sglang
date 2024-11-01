@@ -6,6 +6,7 @@ from typing import Dict, List
 import httpx
 
 from sglang.srt.router.worker import Worker
+from sglang.srt.router.radix_tree import RadixTree
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +68,22 @@ class RoundRobinRouter(BaseRouter):
         worker = self.worker_list[self.idx]
         return worker
 
+from sglang.srt.managers.io_struct import GenerateReqInput
+from dataclasses import asdict
+import json
+
 class ApproxTreeRouter(BaseRouter):
     def __init__(self, server_urls: List[str]):
         super().__init__(server_urls)
+        self.url_to_tree = {url: RadixTree() for url in server_urls}
+        self.url_to_count = {url: 0 for url in server_urls} # count the in-processing requests for workers
+        from sglang.srt.hf_transformers_utils import get_tokenizer
+        self.tokenizer = get_tokenizer("/shared/public/elr-models/meta-llama/Meta-Llama-3.1-8B-Instruct/07eb05b21d191a58c577b4a45982fe0c049d0693/")
     
-    def calc_priority(self):
+    def calc_priority(self, input_ids):
+        ...
+
+    async def dispatch(self, obj: GenerateReqInput):
         """
         1. Match with each radix tree and select the highest match
         2. If the match is above the threshold, send the request to the worker, if not send the request with the shortest request queue
@@ -79,8 +91,57 @@ class ApproxTreeRouter(BaseRouter):
         4. After the request returned, remove the request from the radix tree and insert the cached response into the radix tree
         """
         
-        ...
+        input_ids = self.tokenizer.encode(obj.text)
 
+        THRESHOLD = 0.80
+        highest_rate = 0
+        highest_url = None
+
+        for url, tree in self.url_to_tree.items():
+            matched_id = tree.prefix_match(input_ids)
+            rate = len(matched_id) / len(input_ids)
+            if rate > highest_rate:
+                highest_rate = rate
+                highest_url = url
+        
+        selected_url = None
+        if highest_rate > THRESHOLD:
+            selected_url = highest_url
+        else:
+            # select the worker with the shortest queue
+            selected_url = min(self.url_to_count, key=self.url_to_count.get)
+
+        # insert input_ids to the selected tree
+        self.url_to_tree[selected_url].insert(input_ids)
+
+        res = await self.server_url_to_worker[selected_url].client.post("/generate", json=asdict(obj))
+
+        # import pdb; pdb.set_trace()
+
+        cached_tokens = json.loads(res.content)["meta_info"]["cached_tokens"]
+        print("cached_tokens", cached_tokens)
+
+        # remove input_ids from the selected tree
+        self.url_to_tree[selected_url].delete(input_ids)
+        # insert the cached part of input_ids to the selected tree
+        self.url_to_tree[selected_url].insert(input_ids[:cached_tokens])
+
+        self.url_to_tree[selected_url].pretty_print()
+
+        return res
+
+# {"text":
+#   " thousands of years ago, probably soon after the Flood, a very curious man named Enmeduranki, a Temple Priest of the Chaldeans, climbed up a mountain called Temek.\nEveryone climbed tall mountains. From the summit one could see what happened to the parallel world, called the Nephilim world, and what was deferred. Most of the peaks in that world were sacred mountains, and the high angels that resided there were called ‘Watchers’. The Sumerian priest was advised to go to the mountain by the big god, Ea, but there were some precautions and questions. Enmeduranki, a good",
+#   "meta_info": {
+#       "prompt_tokens":6,
+#       "completion_tokens":128,
+#       "completion_tokens_wo_jump_forward":128,
+#       "cached_tokens":1,
+#       "finish_reason":{"type":"length","length":128},
+#       "id":"16b2e316c4174845a59a012bcb3c6a96"
+#   },
+#   "index":0
+# }
 
 # Extend your router here
 class RoutingPolicy(Enum):

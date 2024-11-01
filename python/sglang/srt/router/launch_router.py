@@ -55,7 +55,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.router.router import get_router_class
+from sglang.srt.router.router import get_router_class, ApproxTreeRouter
 from sglang.srt.router.utils import configure_logger
 from sglang.srt.router.worker import WorkerUpdateReq
 
@@ -156,7 +156,7 @@ async def lifespan(app: FastAPI):
     task.cancel()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI() # lifespan=lifespan)
 
 
 ################################
@@ -245,30 +245,41 @@ async def get_model_info():
     )
 
 
+# @app.api_route("/generate", methods=["POST", "PUT"])
+# async def generate(obj: GenerateReqInput, request: Request):
+#     """
+#     Generates response from the selected worker.
+#     """
+
+#     max_retries = 5
+
+#     for _ in range(max_retries):
+#         try:
+#             selected_worker = router.calc_priority()
+#             res = await selected_worker.client.post("/generate", json=asdict(obj))
+#             res.raise_for_status()
+#         except Exception as e:
+#             logger.warning(f"Error generating response: {e}")
+#             await is_healthy_or_remove(selected_worker)
+#             continue
+
+#         return Response(content=res.content, media_type="application/json")
+
+#     return Response(
+#         status_code=500,
+#         content=f"Failed to generate response after {max_retries} retries",
+#     )
+
+
 @app.api_route("/generate", methods=["POST", "PUT"])
 async def generate(obj: GenerateReqInput, request: Request):
     """
     Generates response from the selected worker.
     """
 
-    max_retries = 5
+    res = await router.dispatch(obj)
 
-    for _ in range(max_retries):
-        try:
-            selected_worker = router.calc_priority()
-            res = await selected_worker.client.post("/generate", json=asdict(obj))
-            res.raise_for_status()
-        except Exception as e:
-            logger.warning(f"Error generating response: {e}")
-            await is_healthy_or_remove(selected_worker)
-            continue
-
-        return Response(content=res.content, media_type="application/json")
-
-    return Response(
-        status_code=500,
-        content=f"Failed to generate response after {max_retries} retries",
-    )
+    return Response(content=res.content, media_type="application/json")
 
 
 ####################
@@ -276,28 +287,28 @@ async def generate(obj: GenerateReqInput, request: Request):
 ####################
 
 
-@app.post("/add_worker")
-async def add_worker(worker_info: WorkerUpdateReq):
-    server_url = worker_info.server_url
-    try:
-        router.add_worker(server_url)
-        return Response(
-            status_code=200, content=f"Worker {server_url} was added succesfully"
-        )
-    except Exception as e:
-        return Response(status_code=500, content=str(e))
+# @app.post("/add_worker")
+# async def add_worker(worker_info: WorkerUpdateReq):
+#     server_url = worker_info.server_url
+#     try:
+#         router.add_worker(server_url)
+#         return Response(
+#             status_code=200, content=f"Worker {server_url} was added succesfully"
+#         )
+#     except Exception as e:
+#         return Response(status_code=500, content=str(e))
 
 
-@app.post("/remove_worker")
-async def remove_worker(worker_info: WorkerUpdateReq):
-    server_url = worker_info.server_url
-    try:
-        router.remove_worker(server_url)
-        return Response(
-            status_code=200, content=f"Worker {server_url} was removed succesfully"
-        )
-    except Exception as e:
-        return Response(status_code=500, content=str(e))
+# @app.post("/remove_worker")
+# async def remove_worker(worker_info: WorkerUpdateReq):
+#     server_url = worker_info.server_url
+#     try:
+#         router.remove_worker(server_url)
+#         return Response(
+#             status_code=200, content=f"Worker {server_url} was removed succesfully"
+#         )
+#     except Exception as e:
+#         return Response(status_code=500, content=str(e))
 
 
 def parse_args():
@@ -331,7 +342,8 @@ def launch_router():
     configure_logger(args.log_level)
 
     router_class = get_router_class(args.policy)
-    router = router_class(args.worker_urls)
+    # router = router_class(args.worker_urls)
+    router = ApproxTreeRouter(args.worker_urls)
     uvicorn.run(app, host=args.host, port=args.port)
 
 
