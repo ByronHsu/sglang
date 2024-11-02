@@ -343,8 +343,8 @@ def launch_router():
 
     # router_class = get_router_class(args.policy)
     # router = router_class(args.worker_urls)
-    # router = ApproxTreeRouter(args.worker_urls)
-    router = RoundRobinRouter(args.worker_urls)
+    router = ApproxTreeRouter(args.worker_urls)
+    # router = RoundRobinRouter(args.worker_urls)
     uvicorn.run(app, host=args.host, port=args.port)
 
 

@@ -87,7 +87,7 @@ def main(args):
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--turns", type=int, default=8)
-    parser.add_argument("--num-qa", type=int, default=64)
+    parser.add_argument("--num-qa", type=int, default=128)
     parser.add_argument("--system-prompt-len", type=int, default=2048)
     parser.add_argument("--len-q", type=int, default=32)
     parser.add_argument("--len-a", type=int, default=128)
