@@ -58,19 +58,25 @@ class RandomRouter(BaseRouter):
         return self.worker_list[idx]
 
 
+
+from sglang.srt.managers.io_struct import GenerateReqInput
+from dataclasses import asdict
+import json
+
 class RoundRobinRouter(BaseRouter):
     def __init__(self, server_urls: List[str]):
         super().__init__(server_urls)
         self.idx = -1
 
     def calc_priority(self) -> Worker:
+        ...
+
+    async def dispatch(self, obj: GenerateReqInput):
         self.idx = (self.idx + 1) % len(self.worker_list)
         worker = self.worker_list[self.idx]
-        return worker
+        res = await worker.client.post("/generate", json=asdict(obj))
+        return res
 
-from sglang.srt.managers.io_struct import GenerateReqInput
-from dataclasses import asdict
-import json
 
 class ApproxTreeRouter(BaseRouter):
     def __init__(self, server_urls: List[str]):
@@ -90,20 +96,30 @@ class ApproxTreeRouter(BaseRouter):
         3. Before the request is sent, insert the request into the radix tree
         4. After the request returned, remove the request from the radix tree and insert the cached response into the radix tree
         """
+
+        # TODO: cached_tokens seems to be 1 digit off when perfectly matched 
         
         input_ids = self.tokenizer.encode(obj.text)
+        # print("input_ids", input_ids)
 
         THRESHOLD = 0.80
-        highest_rate = 0
+        highest_rate = float("-inf")
         highest_url = None
 
         for url, tree in self.url_to_tree.items():
             matched_id = tree.prefix_match(input_ids)
+
+            # print("input_id_len", len(input_ids))
+            # print("matched_id_len", len(matched_id))
+
             rate = len(matched_id) / len(input_ids)
             if rate > highest_rate:
                 highest_rate = rate
                 highest_url = url
         
+        # print("highest rate", highest_rate)
+        # print("highest url", highest_url)
+
         selected_url = None
         if highest_rate > THRESHOLD:
             selected_url = highest_url
@@ -113,20 +129,23 @@ class ApproxTreeRouter(BaseRouter):
 
         # insert input_ids to the selected tree
         self.url_to_tree[selected_url].insert(input_ids)
-
+        self.url_to_count[selected_url] += 1
         res = await self.server_url_to_worker[selected_url].client.post("/generate", json=asdict(obj))
 
         # import pdb; pdb.set_trace()
 
         cached_tokens = json.loads(res.content)["meta_info"]["cached_tokens"]
-        print("cached_tokens", cached_tokens)
+        # print("cached_tokens", cached_tokens)
 
         # remove input_ids from the selected tree
         self.url_to_tree[selected_url].delete(input_ids)
         # insert the cached part of input_ids to the selected tree
         self.url_to_tree[selected_url].insert(input_ids[:cached_tokens])
+        self.url_to_count[selected_url] -= 1
 
-        self.url_to_tree[selected_url].pretty_print()
+        # self.url_to_tree[selected_url].pretty_print()
+
+        # print(self.url_to_count)
 
         return res
 
@@ -167,3 +186,20 @@ def get_router_class(policy_name: str):
         return RoundRobinRouter
     elif policy == RoutingPolicy.RANDOM:
         return RandomRouter
+
+"""
+curl -X POST http://127.0.0.1:8080/generate  -H "Content-Type: application/json" -d '{
+    "text": "Kanye west is, ",
+    "sampling_params": {
+      "temperature": 0
+    }
+  }'
+
+
+curl -X POST http://127.0.0.1:8080/generate  -H "Content-Type: application/json" -d '{
+    "text": "CUDA MODE means, ",
+    "sampling_params": {
+      "temperature": 0
+    }
+  }'
+"""

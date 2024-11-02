@@ -55,7 +55,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.router.router import get_router_class, ApproxTreeRouter
+from sglang.srt.router.router import get_router_class, ApproxTreeRouter, RoundRobinRouter
 from sglang.srt.router.utils import configure_logger
 from sglang.srt.router.worker import WorkerUpdateReq
 
@@ -341,9 +341,10 @@ def launch_router():
 
     configure_logger(args.log_level)
 
-    router_class = get_router_class(args.policy)
+    # router_class = get_router_class(args.policy)
     # router = router_class(args.worker_urls)
-    router = ApproxTreeRouter(args.worker_urls)
+    # router = ApproxTreeRouter(args.worker_urls)
+    router = RoundRobinRouter(args.worker_urls)
     uvicorn.run(app, host=args.host, port=args.port)
 
 
