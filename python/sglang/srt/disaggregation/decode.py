@@ -433,17 +433,21 @@ class DecodePreallocQueue:
             self.pending_reqs.append(decode_req)
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
-        if req.disagg_prefill_dp_rank is not None:
-            return req.disagg_prefill_dp_rank
-
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
+        # If None, it will go to the slow path and resolve prefill_info by _ensure_prefill_info then cache it
         if prefill_info is None:
             return None
+
+        if req.disagg_prefill_dp_rank is not None:
+            return req.disagg_prefill_dp_rank
 
         if prefill_info.dp_size == 1:
             return 0
 
-        if prefill_info.follow_bootstrap_room:
+        if (
+            prefill_info.follow_bootstrap_room
+            and not envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get()
+        ):
             return req.bootstrap_room % prefill_info.dp_size
 
         return None
