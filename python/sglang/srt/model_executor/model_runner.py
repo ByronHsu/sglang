@@ -360,6 +360,21 @@ class _EagerBufferRegistry:
     max_num_tokens: int = 0
 
 
+def should_register_remote_instance_transfer_engine(
+    server_args: ServerArgs, is_draft_worker: bool
+) -> bool:
+    """Return whether this runner owns remote-instance TransferEngine state.
+
+    Target and draft runners share the seed configuration, while the bootstrap
+    protocol has one rank-keyed record. Publishing a draft session would
+    replace the target pointers for the same TP rank.
+    """
+    return (
+        server_args.remote_instance_weight_loader_use_transfer_engine()
+        and not is_draft_worker
+    )
+
+
 class ModelRunner(ModelRunnerKVCacheMixin):
     """ModelRunner runs the forward passes of the models."""
 
@@ -642,7 +657,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             enable=self.server_args.enable_memory_saver
         )
 
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+        if should_register_remote_instance_transfer_engine(
+            self.server_args, self.is_draft_worker
+        ):
             self.remote_instance_init_transfer_engine()
             self.parallelism_config = RankParallelismConfig.from_parallel_state(
                 self.tp_rank
@@ -699,7 +716,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            should_register_remote_instance_transfer_engine(
+                self.server_args, self.is_draft_worker
+            )
             # ModelExpress owns TransferEngine memory registration and metadata
             # publishing for backend=modelexpress. Re-registering here would
             # overlap the same weight buffers.
@@ -716,7 +735,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Register parallelism config with the bootstrap server
         if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
+            should_register_remote_instance_transfer_engine(
+                self.server_args, self.is_draft_worker
+            )
             and self.parallelism_config is not None
         ):
             self._register_parallelism_config_to_bootstrap()
