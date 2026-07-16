@@ -272,8 +272,28 @@ class PrefillBootstrapQueue:
         decode_prefix_len = req.disagg_kv_sender.pop_decode_prefix_len()
         req.start_send_idx = decode_prefix_len
         num_kv_indices_to_send = num_kv_indices - decode_prefix_len
+        assert (
+            num_kv_indices_to_send >= 0
+        ), f"{num_kv_indices=}, {decode_prefix_len=}, {req.rid=}"
         num_pages = kv_to_page_num(
             num_kv_indices_to_send, self.token_to_kv_pool.page_size
+        )
+        logger.debug(
+            "PD decode-radix trace: prefill_bootstrap_transfer_span rid=%s "
+            "room=%s prompt_len=%s decode_prefix_len=%s source_start=%s "
+            "source_end=%s transfer_kv_tokens=%s num_pages=%s "
+            "metadata_buffer_index=%s page_size=%s full_hit=%s",
+            req.rid,
+            req.bootstrap_room,
+            num_kv_indices,
+            decode_prefix_len,
+            req.start_send_idx,
+            num_kv_indices,
+            num_kv_indices_to_send,
+            num_pages,
+            req.metadata_buffer_index,
+            self.token_to_kv_pool.page_size,
+            num_kv_indices_to_send == 0,
         )
         req.disagg_kv_sender.init(num_pages, req.metadata_buffer_index)
         req.pending_bootstrap = False
@@ -722,7 +742,7 @@ class SchedulerDisaggregationPrefillMixin:
                 undone_reqs.append(req)
             elif poll == KVPoll.Success:  # transfer done
                 if req.return_routed_experts:
-                    self.maybe_collect_routed_experts(req)
+                    self.batch_result_processor._maybe_collect_routed_experts(req)
                 release_kv_cache(req, self.tree_cache)  # unlock the tree
                 req.finished_reason = FINISH_LENGTH(length=0)
                 # FIXME: clean up req's data in transfer engine
@@ -1009,7 +1029,35 @@ class SchedulerDisaggregationPrefillMixin:
 
         page_indices = kv_to_page_indices(kv_indices, page_size)
         if not req.disagg_kv_sender.should_send_kv_chunk(len(page_indices), last_chunk):
+            logger.debug(
+                "PD decode-radix trace: prefill_send_chunk_skip rid=%s room=%s "
+                "start=%s end=%s kv_token_count=%s page_count=%s "
+                "last_chunk=%s page_size=%s reason=empty_nonfinal",
+                req.rid,
+                req.bootstrap_room,
+                start_idx,
+                end_idx,
+                len(kv_indices),
+                len(page_indices),
+                last_chunk,
+                page_size,
+            )
             return
+        logger.debug(
+            "PD decode-radix trace: prefill_send_chunk rid=%s room=%s "
+            "start=%s end=%s kv_token_count=%s page_count=%s last_chunk=%s "
+            "metadata_buffer_index=%s page_size=%s aux_only=%s",
+            req.rid,
+            req.bootstrap_room,
+            start_idx,
+            end_idx,
+            len(kv_indices),
+            len(page_indices),
+            last_chunk,
+            req.metadata_buffer_index,
+            page_size,
+            last_chunk and len(page_indices) == 0,
+        )
         req.disagg_kv_sender.send(page_indices, state_indices)
         req.start_send_idx = end_idx
 

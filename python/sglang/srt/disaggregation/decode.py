@@ -509,7 +509,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
         # Always lock to match aggregated scheduling behavior
         self.tree_cache.inc_lock_ref(result.last_device_node)
-        return self._build_decode_prefix_match(req, result)
+        prefix_match = self._build_decode_prefix_match(req, result)
+        logger.debug(
+            "PD decode-radix trace: decode_prefix_match rid=%s room=%s "
+            "prompt_len=%s l1_prefix_len=%s decode_prefix_len=%s "
+            "l2_host_hit_length=%s l3_storage_hit_length=%s page_size=%s",
+            req.rid,
+            req.bootstrap_room,
+            len(req.origin_input_ids),
+            prefix_match.l1_prefix_len,
+            prefix_match.decode_prefix_len,
+            prefix_match.l2_host_hit_length,
+            prefix_match.l3_storage_hit_length,
+            self.token_to_kv_pool_allocator.page_size,
+        )
+        return prefix_match
 
     def _resolve_prefill_dp_rank(self, req: Req) -> Optional[int]:
         prefill_info = self.kv_manager.prefill_info_table.get(_bootstrap_addr(req))
@@ -1038,6 +1052,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             )
             assert decode_req.metadata_buffer_index is not None
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+            logger.debug(
+                "PD decode-radix trace: decode_send_metadata rid=%s room=%s "
+                "prompt_len=%s l1_prefix_len=%s decode_prefix_len=%s "
+                "suffix_kv_tokens=%s dst_page_count=%s "
+                "metadata_buffer_index=%s page_size=%s full_hit=%s",
+                decode_req.req.rid,
+                decode_req.req.bootstrap_room,
+                origin_input_len,
+                prefix_len,
+                total_prefix_len,
+                len(kv_indices),
+                len(page_indices),
+                decode_req.metadata_buffer_index,
+                kv_transfer_page_size,
+                len(page_indices) == 0,
+            )
             decode_req.kv_receiver.send_metadata(
                 page_indices,
                 decode_req.metadata_buffer_index,

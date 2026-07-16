@@ -44,7 +44,6 @@ use crate::{
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
-        generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::V1RerankReqInput,
         responses::{ResponsesGetParams, ResponsesRequest},
@@ -54,6 +53,7 @@ use crate::{
     },
     routers::{
         conversations,
+        http::pd_types::PDGenerateRequest,
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
@@ -172,12 +172,12 @@ async fn get_model_info(State(state): State<Arc<AppState>>, req: Request) -> Res
 async fn generate(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    Json(body): Json<GenerateRequest>,
+    Json(body): Json<PDGenerateRequest>,
 ) -> Response {
-    let model_id = body.model.as_deref();
+    let model_id = body.request.model.as_deref();
     state
         .router
-        .route_generate(Some(&headers), &body, model_id)
+        .route_generate(Some(&headers), &body.request, model_id, body.rank_routing())
         .await
 }
 

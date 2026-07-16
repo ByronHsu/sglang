@@ -1463,19 +1463,26 @@ class MooncakeKVManager(CommonKVManager):
                     if room not in self.transfer_infos:
                         self.transfer_infos[room] = {}
 
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    self.transfer_infos[room][mooncake_session_id] = transfer_info
+                    decode_prefix_len = transfer_info.decode_prefix_len or 0
+                    logger.debug(
+                        "PD decode-radix trace: prefill_recv_metadata backend=mooncake "
+                        "room=%s session=%s decode_prefix_len=%s dst_page_count=%s "
+                        "aux_index=%s required_dst_info_num=%s dummy=%s state_count=%s",
+                        room,
+                        mooncake_session_id,
+                        decode_prefix_len,
+                        len(transfer_info.dst_kv_indices),
+                        transfer_info.dst_aux_index,
+                        transfer_info.required_dst_info_num,
+                        transfer_info.is_dummy,
+                        len(transfer_info.dst_state_indices),
                     )
+                    if not self.record_decode_prefix_len(room, decode_prefix_len):
+                        continue
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.req_to_decode_prefix_len[room] = next(
-                            (
-                                info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
-                                if info.decode_prefix_len is not None
-                            ),
-                            0,
-                        )
                         self.update_status(room, KVPoll.WaitingForInput)
 
         threading.Thread(target=bootstrap_thread).start()
@@ -1869,6 +1876,19 @@ class MooncakeKVReceiver(CommonKVReceiver):
             self.kv_mgr.register_staging_room_bootstrap(
                 self.bootstrap_room, self.bootstrap_infos, self
             )
+
+        logger.debug(
+            "PD decode-radix trace: decode_send_metadata_backend backend=mooncake "
+            "room=%s decode_prefix_len=%s dst_page_count=%s aux_index=%s "
+            "state_count=%s required_dst_info_num=%s target_count=%s",
+            self.bootstrap_room,
+            decode_prefix_len or 0,
+            len(kv_indices),
+            aux_index,
+            len(state_indices) if state_indices is not None else 0,
+            self.required_dst_info_num,
+            len(self.bootstrap_infos),
+        )
 
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)

@@ -3,6 +3,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.managers.scheduler_components import metrics_reporter
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def test_fwd_occupancy_survives_active_window_boundary():

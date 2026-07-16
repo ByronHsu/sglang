@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
 
-use super::pd_types::api_path;
+use super::pd_types::{api_path, PDRankRouting};
 use crate::{
     config::types::RetryConfig,
     core::{
@@ -65,6 +65,7 @@ struct PDRequestContext<'a> {
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+    pd_rank_routing: PDRankRouting,
 }
 
 /// Marker placed on a `Response` by paths inside
@@ -224,6 +225,52 @@ impl PDRouter {
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
+    const ROUTED_DP_RANK_KEY: &'static str = "routed_dp_rank";
+    const DATA_PARALLEL_RANK_KEY: &'static str = "data_parallel_rank";
+    const ROUTED_PREFILL_DP_RANK_KEY: &'static str = "routed_prefill_dp_rank";
+    const ROUTED_DECODE_DP_RANK_KEY: &'static str = "routed_decode_dp_rank";
+
+    fn request_for_dp_stage(
+        mut request: Value,
+        stage_rank: Option<usize>,
+    ) -> Result<Value, String> {
+        let obj = request
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+
+        // Normalize both accepted single-rank spellings to the current backend
+        // field. The explicit stage rank wins; otherwise each stage falls back
+        // to the legacy single rank.
+        let legacy_routed_rank = obj.remove(Self::ROUTED_DP_RANK_KEY);
+        let legacy_data_parallel_rank = obj.remove(Self::DATA_PARALLEL_RANK_KEY);
+        obj.remove(Self::ROUTED_PREFILL_DP_RANK_KEY);
+        obj.remove(Self::ROUTED_DECODE_DP_RANK_KEY);
+
+        let rank = stage_rank.map(Value::from).or_else(|| {
+            legacy_routed_rank
+                .filter(|rank| !rank.is_null())
+                .or_else(|| legacy_data_parallel_rank.filter(|rank| !rank.is_null()))
+        });
+
+        if let Some(rank) = rank {
+            obj.insert(Self::ROUTED_DP_RANK_KEY.to_string(), rank);
+        }
+
+        Ok(request)
+    }
+
+    fn requests_for_pd_stages(
+        request: Value,
+        rank_routing: PDRankRouting,
+    ) -> Result<(Value, Value), String> {
+        let prefill_request = Self::request_for_dp_stage(
+            request.clone(),
+            rank_routing.prefill.or(rank_routing.legacy),
+        )?;
+        let decode_request =
+            Self::request_for_dp_stage(request, rank_routing.decode.or(rank_routing.legacy))?;
+        Ok((prefill_request, decode_request))
+    }
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -352,11 +399,21 @@ impl PDRouter {
                             Err(e) => return Self::handle_serialization_error(e),
                         };
 
+                        let (prefill_json_request, decode_json_request) =
+                            match Self::requests_for_pd_stages(
+                                json_request,
+                                context.pd_rank_routing,
+                            ) {
+                                Ok(requests) => requests,
+                                Err(e) => return Self::handle_serialization_error(e),
+                            };
+
                         let ctx_is_stream = context.is_stream;
                         let response = self
                             .execute_dual_dispatch_internal(
                                 headers,
-                                json_request,
+                                prefill_json_request,
+                                decode_json_request,
                                 context,
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
@@ -569,7 +626,8 @@ impl PDRouter {
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
-        json_request: Value,
+        prefill_json_request: Value,
+        decode_json_request: Value,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
@@ -591,7 +649,7 @@ impl PDRouter {
             &self.client,
             prefill.url(),
             context.route,
-            &json_request,
+            &prefill_json_request,
             headers,
             false,
         );
@@ -599,21 +657,92 @@ impl PDRouter {
             &self.client,
             decode.url(),
             context.route,
-            &json_request,
+            &decode_json_request,
             headers,
             false,
         );
 
-        // Send both requests concurrently and wait for both
-        // Note: Using borrowed references avoids heap allocation
+        // Start decode concurrently with prefill. If prefill fails, decode can
+        // never receive the KV it is waiting for, so abort it immediately
+        // instead of turning the prefill failure into a full decode timeout.
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        let decode_task = tokio::spawn(async move { decode_request.send().await });
+        let prefill_result = prefill_request.send().await;
+        let prefill_failed = match &prefill_result {
+            Ok(response) => !response.status().is_success(),
+            Err(_) => true,
+        };
+        let prefill_breaker_ok = match &prefill_result {
+            Ok(response) => {
+                let status = response.status();
+                status.is_success() || status.is_client_error()
+            }
+            Err(_) => false,
+        };
+
+        if prefill_failed {
+            // Abort before reading the prefill error body: even a slow/malformed
+            // error body cannot keep the decode request alive. Decode is left
+            // breaker-neutral because it was cancelled due to the other stage.
+            decode_task.abort();
+            let _ = decode_task.await;
+            let prefill_url = prefill.url().to_string();
+            let mut response = match self
+                .process_prefill_response(prefill_result, &prefill_url, false)
+                .await
+            {
+                Err(error_response) => error_response,
+                Ok(_) => error::internal_error(
+                    "prefill_error_handling_failed",
+                    "Failed prefill response was unexpectedly accepted",
+                ),
+            };
+            prefill.record_outcome(prefill_breaker_ok);
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            events::RequestReceivedEvent {}.emit();
+            return response;
+        }
+
+        let prefill_url = prefill.url().to_string();
+        let prefill_body = match self
+            .process_prefill_response(prefill_result, &prefill_url, context.return_logprob)
+            .await
+        {
+            Ok((_, body)) => body,
+            Err(mut error_response) => {
+                // Defensive: the status check above should make this branch
+                // unreachable, but preserve the same cancellation semantics if
+                // prefill response processing gains another failure mode.
+                decode_task.abort();
+                let _ = decode_task.await;
+                prefill.record_outcome(false);
+                error_response
+                    .extensions_mut()
+                    .insert(BreakerOutcomesRecorded);
+                events::RequestReceivedEvent {}.emit();
+                return error_response;
+            }
+        };
+
+        let decode_result = match decode_task.await {
+            Ok(result) => result,
+            Err(e) => {
+                prefill.record_outcome(true);
+                decode.record_outcome(false);
+                let mut response = error::bad_gateway(
+                    "decode_task_error",
+                    format!("Decode request task failed: {}", e),
+                );
+                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                events::RequestReceivedEvent {}.emit();
+                return response;
+            }
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -631,29 +760,13 @@ impl PDRouter {
                         status
                     );
 
-                    // Per-worker breaker attribution before the synthetic 5xx
-                    // response takes over. Prefill ran concurrently in the
-                    // `tokio::join!`: tick it based on its actual response
-                    // status, not on the decode-driven failure. For
-                    // non-streaming the response carries no tracked stream
-                    // so record decode's outcome here too — but treat 4xx
-                    // as a client fault rather than a worker fault, matching
-                    // the legacy outer-dispatcher rule and the streaming
-                    // `BreakerTrackedStream` pre-mark in
-                    // `create_streaming_response`. For streaming
-                    // `handle_decode_error_response` wraps the synthetic
-                    // error SSE in a `BreakerTrackedStream` that ticks
-                    // decode on drop, so skip to avoid double-counting.
-                    // Mark the response so the outer dispatcher skips its
-                    // status-derived `record_outcome`.
-                    let prefill_ok = match &prefill_result {
-                        Ok(r) => {
-                            let s = r.status();
-                            s.is_success() || s.is_client_error()
-                        }
-                        Err(_) => false,
-                    };
-                    prefill.record_outcome(prefill_ok);
+                    // Prefill already completed successfully. Record that
+                    // stage independently before the decode-driven synthetic
+                    // error takes over. For streaming, the tracked decode
+                    // error stream records decode on drop; non-streaming must
+                    // record decode here. Mark the response so the outer
+                    // dispatcher does not double-count either stage.
+                    prefill.record_outcome(true);
                     if !context.is_stream {
                         let decode_ok = status.is_success() || status.is_client_error();
                         decode.record_outcome(decode_ok);
@@ -665,30 +778,6 @@ impl PDRouter {
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
                 }
-
-                // Process prefill response
-                let prefill_body = if context.return_logprob {
-                    match self
-                        .process_prefill_response(
-                            prefill_result,
-                            prefill.url(),
-                            context.return_logprob,
-                        )
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                } else {
-                    // Even if we don't need logprobs, we should check prefill status
-                    match self
-                        .process_prefill_response(prefill_result, prefill.url(), false)
-                        .await
-                    {
-                        Ok((_, body)) => body,
-                        Err(error_response) => return error_response,
-                    }
-                };
 
                 if context.is_stream {
                     // Streaming response
@@ -757,22 +846,12 @@ impl PDRouter {
                 // stream will ever wrap a response (streaming path) and
                 // we shortcut past the outer non-streaming
                 // `record_outcome` too — so record decode failure
-                // directly. Prefill ran concurrently in the
-                // `tokio::join!`: record its real per-worker outcome
-                // (success on a 2xx/4xx send, failure on transport
-                // error) so the decode-driven 502 doesn't penalise a
-                // healthy prefill. Mark the response so the outer
-                // dispatcher skips its status-derived `record_outcome`
-                // and we don't double-count.
+                // directly. Prefill has already completed successfully,
+                // so record it independently rather than attributing the
+                // decode-driven 502 to both stages. Mark the response so
+                // the outer dispatcher does not double-count.
                 decode.record_outcome(false);
-                let prefill_ok = match &prefill_result {
-                    Ok(res) => {
-                        let s = res.status();
-                        s.is_success() || s.is_client_error()
-                    }
-                    Err(_) => false,
-                };
-                prefill.record_outcome(prefill_ok);
+                prefill.record_outcome(true);
 
                 let mut response = error::bad_gateway(
                     "decode_server_error",
@@ -1387,6 +1466,7 @@ impl RouterTrait for PDRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        pd_rank_routing: PDRankRouting,
     ) -> Response {
         let is_stream = body.stream;
         let return_logprob = body.return_logprob.unwrap_or(false);
@@ -1407,6 +1487,7 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            pd_rank_routing,
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1449,6 +1530,7 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            pd_rank_routing: PDRankRouting::default(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1483,6 +1565,7 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            pd_rank_routing: PDRankRouting::default(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1509,6 +1592,7 @@ impl RouterTrait for PDRouter {
             request_text: req_text,
             model_id,
             headers: headers.cloned(),
+            pd_rank_routing: PDRankRouting::default(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await

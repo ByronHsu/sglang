@@ -14,7 +14,7 @@ use crate::{
     },
     observability::metrics::{metrics_labels, Metrics},
     protocols::{chat::ChatCompletionRequest, generate::GenerateRequest},
-    routers::RouterTrait,
+    routers::{http::pd_types::PDRankRouting, RouterTrait},
 };
 
 /// gRPC PD (Prefill-Decode) router implementation for SGLang
@@ -225,6 +225,7 @@ impl RouterTrait for GrpcPDRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
+        _pd_rank_routing: PDRankRouting,
     ) -> Response {
         self.route_generate_impl(headers, body, model_id).await
     }

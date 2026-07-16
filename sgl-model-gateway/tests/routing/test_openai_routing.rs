@@ -635,7 +635,9 @@ async fn test_unsupported_endpoints() {
         rid: None,
     };
 
-    let response = router.route_generate(None, &generate_request, None).await;
+    let response = router
+        .route_generate(None, &generate_request, None, Default::default())
+        .await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
     let completion_request = create_minimal_completion_request();

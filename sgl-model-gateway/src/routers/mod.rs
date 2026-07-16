@@ -10,6 +10,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use self::http::pd_types::PDRankRouting;
 use crate::protocols::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -82,6 +83,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         _headers: Option<&HeaderMap>,
         _body: &GenerateRequest,
         _model_id: Option<&str>,
+        _pd_rank_routing: PDRankRouting,
     ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
