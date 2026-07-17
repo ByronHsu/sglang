@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
@@ -19,6 +20,8 @@ from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.processors.kimi_common import KimiGridMMDataMixin
+
+_ENABLE_GPU_IMAGE_PREPROCESSING = envs.SGLANG_ENABLE_KIMI_GPU_IMAGE_PREPROCESSING.get()
 
 # ---------------------------------------------------------------------------
 # GPU image preprocessing utilities (resize, pad, normalize, patchify on CUDA)
@@ -244,7 +247,7 @@ class KimiGPUProcessorWrapper:
         # process_mm_data passes images via kwargs["images"]
         images = images or kwargs.pop("images", None)
 
-        if images and torch.cuda.is_available():
+        if images and _ENABLE_GPU_IMAGE_PREPROCESSING and torch.cuda.is_available():
             return self._gpu_call(text, images)
         return self._cpu_call(text, images, **kwargs)
 
@@ -338,7 +341,7 @@ class KimiGPUProcessorWrapper:
 # Compatible with KimiVLForConditionalGeneration
 class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
     models = [KimiK25ForConditionalGeneration]
-    gpu_image_decode = True  # nvJPEG for JPEG, PIL fallback for others
+    gpu_image_decode = _ENABLE_GPU_IMAGE_PREPROCESSING
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
