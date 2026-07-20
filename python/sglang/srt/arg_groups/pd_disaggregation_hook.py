@@ -9,6 +9,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DECODE_RADIX_SPEC_ALGORITHMS = frozenset({"EAGLE", "EAGLE3"})
+
 
 def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
     """Validate and normalize PD-disaggregation server args."""
@@ -38,11 +40,15 @@ def handle_pd_disaggregation(server_args: "ServerArgs") -> None:
                     "('nixl', 'mooncake'), but got "
                     f"{server_args.disaggregation_transfer_backend!r}"
                 )
-            if server_args.speculative_algorithm is not None:
+            speculative_algorithm = server_args.speculative_algorithm
+            if (
+                speculative_algorithm is not None
+                and speculative_algorithm.upper() not in _DECODE_RADIX_SPEC_ALGORITHMS
+            ):
                 raise ValueError(
-                    "--disaggregation-decode-enable-radix-cache is incompatible "
-                    "with speculative decoding "
-                    f"(--speculative-algorithm {server_args.speculative_algorithm})"
+                    "--disaggregation-decode-enable-radix-cache with speculative "
+                    "decoding currently supports only EAGLE/EAGLE3, but got "
+                    f"--speculative-algorithm {speculative_algorithm}"
                 )
             if server_args.enable_dp_attention:
                 logger.warning(

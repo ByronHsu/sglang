@@ -78,6 +78,27 @@ class TestLoadBalanceMethod(unittest.TestCase):
 
         self.assertFalse(server_args.disable_radix_cache)
 
+    def test_pd_decode_radix_cache_allows_eagle3(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            disaggregation_mode="decode",
+            disaggregation_decode_enable_radix_cache=True,
+            disaggregation_transfer_backend="nixl",
+            speculative_algorithm="EAGLE3",
+        )
+
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_pd_decode_radix_cache_rejects_unsupported_spec_algorithm(self):
+        with self.assertRaisesRegex(ValueError, "supports only EAGLE/EAGLE3"):
+            ServerArgs(
+                model_path="dummy",
+                disaggregation_mode="decode",
+                disaggregation_decode_enable_radix_cache=True,
+                disaggregation_transfer_backend="nixl",
+                speculative_algorithm="NGRAM",
+            )
+
     def test_pd_decode_radix_cache_rejects_unknown_backend(self):
         with self.assertRaises(ValueError) as context:
             ServerArgs(

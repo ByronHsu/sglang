@@ -159,6 +159,38 @@ class TestDecodeLockRefScenarios(unittest.TestCase):
         # The evictable size should equal total inserted tokens
         self.assertEqual(cache.evictable_size(), len(full_ids))
 
+    def test_eagle_incremental_transfer_retains_bigram_prefix(self):
+        cache, req_to_token = _make_cache_with_pools()
+        cache.is_eagle = True
+
+        prefix = [1, 2, 3, 4]
+        prefix_vals = [10, 20, 30, 40]
+        self._populate_prefix(cache, prefix, prefix_vals)
+
+        result = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", prefix))))
+        self.assertEqual(result.device_indices.tolist(), prefix_vals[:-1])
+        cache.inc_lock_ref(result.last_device_node)
+
+        full_ids = prefix + [5, 6]
+        full_vals = prefix_vals + [50, 60]
+        req_to_token[0, : len(full_vals)] = torch.tensor(full_vals, dtype=torch.int64)
+        req = _make_req(
+            full_ids,
+            req_pool_idx=0,
+            cache_protected_len=len(result.device_indices),
+            last_node=result.last_device_node,
+        )
+
+        cache.cache_unfinished_req(req)
+        cache.cache_finished_req(req)
+
+        exact = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", full_ids)))
+        )
+        self.assertEqual(exact.device_indices.tolist(), full_vals[:-1])
+        self.assertEqual(cache.protected_size(), 0)
+        self.assertEqual(cache.evictable_size(), len(full_ids) - 1)
+
     def test_full_transfer_success(self):
         """Scenario 2: no prefix match, full KV transferred, succeeds.
 

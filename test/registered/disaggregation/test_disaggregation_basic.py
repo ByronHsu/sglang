@@ -319,7 +319,7 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
         cls.model = DEFAULT_TARGET_MODEL_EAGLE3
         spec_args = [
             "--speculative-algorithm",
-            "EAGLE",
+            "EAGLE3",
             "--speculative-draft-model-path",
             DEFAULT_DRAFT_MODEL_EAGLE3,
             "--speculative-num-steps",
@@ -333,10 +333,16 @@ class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):
             "--dtype=float16",
         ]
         cls.extra_prefill_args = spec_args
-        cls.extra_decode_args = spec_args
+        cls.extra_decode_args = [
+            *spec_args,
+            "--disaggregation-decode-enable-radix-cache",
+        ]
         cls.launch_all()
 
     def test_gsm8k(self):
+        decode_info = requests.get(f"{self.decode_url}/server_info", timeout=10).json()
+        self.assertFalse(decode_info.get("disable_radix_cache", True))
+
         args = SimpleNamespace(
             base_url=f"http://{self.base_host}:{self.lb_port}",
             eval_name="gsm8k",
