@@ -476,6 +476,98 @@ async fn v1_tokenize(
     tokenize::tokenize(&state.context.tokenizer_registry, request).await
 }
 
+/// Forward structured token counts to a worker that owns the model's chat
+/// template. The gateway's local tokenizer only supports raw prompts.
+async fn v1_messages_count_tokens(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    Json(request): Json<Value>,
+) -> Response {
+    use crate::{
+        core::{ConnectionMode, WorkerType},
+        routers::{error as router_error, header_utils},
+    };
+
+    let Some(model) = request.get("model").and_then(Value::as_str) else {
+        return router_error::bad_request(
+            "count_tokens_model_required",
+            "The count-tokens request must include a string model field",
+        );
+    };
+    let model_filter = state.context.router_config.enable_igw.then_some(model);
+    let worker = state
+        .context
+        .worker_registry
+        .get_workers_filtered(
+            model_filter,
+            Some(WorkerType::Regular),
+            Some(ConnectionMode::Http),
+            None,
+            false,
+        )
+        .into_iter()
+        .filter(|worker| worker.is_available())
+        .min_by_key(|worker| worker.load());
+
+    let Some(worker) = worker else {
+        return router_error::service_unavailable(
+            "no_available_workers",
+            "No available HTTP workers for token counting",
+        );
+    };
+
+    let request = match worker.prepare_request(request).await {
+        Ok(request) => request,
+        Err(error) => {
+            return router_error::bad_request(
+                "count_tokens_worker_request_failed",
+                format!("Failed to prepare count-tokens worker request: {error}"),
+            );
+        }
+    };
+    let url = worker.endpoint_url("/v1/messages/count_tokens");
+    let mut upstream = state.context.client.post(&url).json(&request);
+
+    for (name, value) in &headers {
+        if header_utils::should_forward_request_header(name.as_str()) {
+            upstream = upstream.header(name, value);
+        }
+    }
+    if let Some(key) = worker.api_key() {
+        upstream = upstream.bearer_auth(key);
+    }
+
+    let upstream = match upstream.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            worker.record_outcome(false);
+            return router_error::bad_gateway(
+                "count_tokens_upstream_failed",
+                format!("Count-tokens worker request failed: {error}"),
+            );
+        }
+    };
+    let status = StatusCode::from_u16(upstream.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let response_headers = header_utils::preserve_response_headers(upstream.headers());
+    let body = match upstream.bytes().await {
+        Ok(body) => body,
+        Err(error) => {
+            worker.record_outcome(false);
+            return router_error::bad_gateway(
+                "count_tokens_upstream_body_failed",
+                format!("Failed to read count-tokens response: {error}"),
+            );
+        }
+    };
+
+    worker.record_outcome(!status.is_server_error());
+    let mut response = Response::new(axum::body::Body::from(body));
+    *response.status_mut() = status;
+    *response.headers_mut() = response_headers;
+    response
+}
+
 async fn v1_detokenize(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DetokenizeRequest>,
@@ -576,6 +668,7 @@ pub fn build_app(
         )
         // Tokenize / Detokenize endpoints
         .route("/v1/tokenize", post(v1_tokenize))
+        .route("/v1/messages/count_tokens", post(v1_messages_count_tokens))
         .route("/v1/detokenize", post(v1_detokenize))
         .route_layer(axum::middleware::from_fn_with_state(
             app_state.clone(),

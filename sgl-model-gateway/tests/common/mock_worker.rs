@@ -86,6 +86,10 @@ impl MockWorker {
             .route("/model_info", get(model_info_handler))
             .route("/generate", post(generate_handler))
             .route("/v1/chat/completions", post(chat_completions_handler))
+            .route(
+                "/v1/messages/count_tokens",
+                post(messages_count_tokens_handler),
+            )
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
             .route("/v1/responses", post(responses_handler))
@@ -1392,6 +1396,32 @@ async fn v1_models_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) 
             "created": timestamp,
             "owned_by": "organization-owner"
         }]
+    }))
+    .into_response()
+}
+
+async fn messages_count_tokens_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(request): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+    if should_fail(&config).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": {
+                    "message": "Random failure for testing",
+                    "type": "internal_error",
+                    "code": "internal_error"
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "input_tokens": 3,
+        "received": request,
     }))
     .into_response()
 }
