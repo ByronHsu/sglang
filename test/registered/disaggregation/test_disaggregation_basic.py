@@ -1,16 +1,22 @@
 import asyncio
 import json
 import os
+import signal
+import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import aiohttp
 import openai
+import psutil
 import requests
 from transformers import AutoTokenizer
 
+from sglang.srt.environ import envs
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
 from sglang.test.run_eval import run_eval
@@ -23,7 +29,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=509, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=760, stage="base-b", runner_config="2-gpu-large")
 
 
 class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
@@ -270,6 +276,25 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
             f"but got {res['usage']['completion_tokens']}"
         )
 
+    def test_bootstrap_server_subprocess_running(self):
+        """The prefill instance must host its PD bootstrap server in a
+        dedicated subprocess (proc title `sglang::disagg_bootstrap_server`).
+        Catches a silent fallback to the legacy in-thread server."""
+        import psutil
+
+        prefill = psutil.Process(self.process_prefill.pid)
+        cmdlines = []
+        for child in prefill.children(recursive=True):
+            try:
+                cmdlines.append(" ".join(child.cmdline()))
+            except psutil.NoSuchProcess:
+                continue
+        self.assertTrue(
+            any("sglang::disagg_bootstrap_server" in c for c in cmdlines),
+            "No sglang::disagg_bootstrap_server child found under prefill pid "
+            f"{self.process_prefill.pid}; children: {cmdlines}",
+        )
+
 
 class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
     @classmethod
@@ -310,6 +335,237 @@ class TestDisaggregationMooncakeFailure(PDDisaggregationServerBase):
             except Exception as health_check_error:
                 # If health check fails, re-raise the original exception
                 raise e from health_check_error
+
+
+class TestDisaggregationHeartbeatFailover(PDDisaggregationServerBase):
+    """Decode-side heartbeat hardening.
+
+    1. A transient stall of the process hosting the prefill bootstrap server,
+       shorter than one full miss cycle (interval + probe timeout), must NOT
+       abort any in-flight room ("Lost connection with prefill" mass-kill).
+    2. A real prefill death must still be detected within the configured
+       window, (interval + timeout) * max_failures, instead of requests
+       hanging until the 300s bootstrap/waiting timeouts.
+    """
+
+    capture_per_side_logs = True
+
+    # Pinned via env overrides in setUpClass so the timing math below is
+    # deterministic. 2.0 is the floor-clamp minimum for interval and timeout.
+    HEARTBEAT_INTERVAL = 2.0
+    HEARTBEAT_TIMEOUT = 2.0
+    HEARTBEAT_MAX_FAILURES = 2
+
+    LOST_CONNECTION_CANARY = "Lost connection with prefill"
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls._heartbeat_env = ExitStack()
+        cls._heartbeat_env.enter_context(
+            envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.override(
+                cls.HEARTBEAT_INTERVAL
+            )
+        )
+        cls._heartbeat_env.enter_context(
+            envs.SGLANG_DISAGGREGATION_HEARTBEAT_TIMEOUT.override(cls.HEARTBEAT_TIMEOUT)
+        )
+        cls._heartbeat_env.enter_context(
+            envs.SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE.override(
+                cls.HEARTBEAT_MAX_FAILURES
+            )
+        )
+        # Subprocesses launched inside the override blocks inherit the values.
+        cls.launch_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            super().tearDownClass()
+        finally:
+            cls._heartbeat_env.close()
+
+    def _bootstrap_host_processes(self):
+        """Process(es) hosting the prefill bootstrap server.
+
+        Today the bootstrap server runs as a daemon thread inside the prefill
+        launch_server (tokenizer manager) process. If/when it moves into a
+        dedicated subprocess (proctitle sglang::disagg_bootstrap_server),
+        stall that child instead so the test keeps targeting the right
+        process.
+        """
+        parent = psutil.Process(self.process_prefill.pid)
+        bootstrap_procs = []
+        for proc in [parent] + parent.children(recursive=True):
+            try:
+                ident = " ".join([proc.name(), *proc.cmdline()])
+            except psutil.Error:
+                continue
+            if "disagg_bootstrap_server" in ident:
+                bootstrap_procs.append(proc)
+        return bootstrap_procs or [parent]
+
+    def _decode_log_snapshot(self):
+        return tuple(
+            len(buf.getvalue()) if buf is not None else 0
+            for buf in (self._decode_stdout_buf, self._decode_stderr_buf)
+        )
+
+    def _decode_log_since(self, snapshot):
+        parts = []
+        for buf, start in zip(
+            (self._decode_stdout_buf, self._decode_stderr_buf), snapshot
+        ):
+            if buf is not None:
+                parts.append(buf.getvalue()[start:])
+        return "".join(parts)
+
+    def _generate(self, prompt, max_new_tokens=32, timeout=90):
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                },
+            },
+            timeout=timeout,
+        )
+        return response
+
+    def _request_worker(self, worker_id, results, stop_event):
+        seq = 0
+        while not stop_event.is_set():
+            try:
+                response = self._generate(f"[w{worker_id}-{seq}] What is 2+2?")
+                results.append(
+                    {
+                        "worker": worker_id,
+                        "seq": seq,
+                        "ok": response.status_code == 200,
+                        "detail": f"status={response.status_code} body={response.text[:200]}",
+                    }
+                )
+            except Exception as e:
+                results.append(
+                    {
+                        "worker": worker_id,
+                        "seq": seq,
+                        "ok": False,
+                        "detail": f"exception={e!r}",
+                    }
+                )
+            seq += 1
+
+    def test_transient_stall_no_abort_then_real_death_detected(self):
+        miss_cycle = self.HEARTBEAT_INTERVAL + self.HEARTBEAT_TIMEOUT
+
+        # Warm up: the decode side only heartbeats prefill addrs it has seen
+        # a request for (prefill_info_table entry), so pair P and D first.
+        warmup = self._generate("warmup", max_new_tokens=4)
+        self.assertEqual(warmup.status_code, 200, warmup.text)
+
+        # ---- Phase 1: transient bootstrap stall, zero aborted rooms ----
+        log_snapshot = self._decode_log_snapshot()
+        results = []
+        stop_event = threading.Event()
+        workers = [
+            threading.Thread(
+                target=self._request_worker,
+                args=(i, results, stop_event),
+                daemon=True,
+            )
+            for i in range(4)
+        ]
+        for worker in workers:
+            worker.start()
+        time.sleep(2)  # ensure rooms are in flight
+
+        stall_duration = miss_cycle - 1.0  # at most ONE probe miss can land
+        bootstrap_procs = self._bootstrap_host_processes()
+        try:
+            for proc in bootstrap_procs:
+                proc.send_signal(signal.SIGSTOP)
+            time.sleep(stall_duration)
+        finally:
+            for proc in bootstrap_procs:
+                proc.send_signal(signal.SIGCONT)
+
+        # Let the heartbeat recover (counter resets on next 200) and let
+        # requests that spanned the stall drain.
+        time.sleep(2 * miss_cycle)
+        stop_event.set()
+        for worker in workers:
+            worker.join(timeout=90)
+
+        failed = [r for r in results if not r["ok"]]
+        self.assertGreater(len(results), 0, "no requests completed at all")
+        self.assertEqual(
+            failed,
+            [],
+            f"{len(failed)}/{len(results)} request(s) aborted during a "
+            f"transient {stall_duration:.1f}s bootstrap stall "
+            f"(< interval + timeout = {miss_cycle:.1f}s): {failed[:5]}",
+        )
+        self.assertNotIn(
+            self.LOST_CONNECTION_CANARY,
+            self._decode_log_since(log_snapshot),
+            "decode mass-killed rooms during a transient bootstrap stall",
+        )
+
+        # ---- Phase 2: real prefill death is detected within the window ----
+        log_snapshot = self._decode_log_snapshot()
+        kill_results = []
+        kill_stop = threading.Event()
+        kill_workers = [
+            threading.Thread(
+                target=self._request_worker,
+                args=(100 + i, kill_results, kill_stop),
+                daemon=True,
+            )
+            for i in range(4)
+        ]
+        for worker in kill_workers:
+            worker.start()
+        time.sleep(1)  # rooms in flight at kill time
+
+        # The fixture's fail-fast watcher would abort the whole test run when
+        # a server process dies; the kill below is intentional.
+        if self._fail_fast_stop is not None:
+            self._fail_fast_stop.set()
+        kill_process_tree(self.process_prefill.pid)
+
+        # Worst case: max_failures misses, each costing up to
+        # interval + probe timeout, plus scheduling slack.
+        detection_window = miss_cycle * self.HEARTBEAT_MAX_FAILURES + 22.0
+        deadline = time.monotonic() + detection_window
+        detected = False
+        while time.monotonic() < deadline:
+            if self.LOST_CONNECTION_CANARY in self._decode_log_since(log_snapshot):
+                detected = True
+                break
+            time.sleep(1)
+        kill_stop.set()
+        self.assertTrue(
+            detected,
+            f"decode did not mark the dead prefill lost within "
+            f"{detection_window:.0f}s (rooms would hang until the 300s "
+            f"bootstrap/waiting timeouts)",
+        )
+
+        # In-flight rooms must resolve (as failures) promptly after
+        # detection, not linger toward the 300s per-request timeouts.
+        for worker in kill_workers:
+            worker.join(timeout=60)
+        hung = [w for w in kill_workers if w.is_alive()]
+        self.assertEqual(
+            len(hung),
+            0,
+            f"{len(hung)} request worker(s) still blocked after the "
+            "heartbeat declared the prefill dead",
+        )
 
 
 class TestDisaggregationMooncakeSpec(PDDisaggregationServerBase):

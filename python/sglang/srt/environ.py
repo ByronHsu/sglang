@@ -295,12 +295,23 @@ class Envs:
     SGLANG_DISAGGREGATION_QUEUE_SIZE = EnvInt(4)
     SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
+    # Per-probe (connect, read) timeout for the decode-side heartbeat against the
+    # prefill bootstrap server. Deliberately generous by default: worst-case
+    # detection of a dead prefill is (INTERVAL + TIMEOUT) * MAX_FAILURE = 30s,
+    # trading slower failover for immunity to transient control-plane stalls
+    # that would otherwise mass-abort every in-flight room. Genuinely dead nodes
+    # also surface via SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT / WAITING_TIMEOUT.
+    SGLANG_DISAGGREGATION_HEARTBEAT_TIMEOUT = EnvFloat(10.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
+    # Kill switch: run the PD bootstrap server as a daemon thread inside the
+    # tokenizer manager / router process (legacy behavior) instead of a
+    # dedicated subprocess.
+    SGLANG_DISABLE_BOOTSTRAP_SERVER_SUBPROCESS = EnvBool(False)
     # Extra slots in req_to_token_pool for decode workers (only effective when
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
@@ -639,6 +650,11 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # Kill switch for the raw-frame zmq transport of multimodal tensors in
+    # "default" tensor transport mode (tensors ride as separate multipart
+    # frames that relays forward without re-pickling). Sender-side gate only:
+    # receivers always accept both wire formats, so flipping it is safe live.
+    SGLANG_DISABLE_MM_RAW_FRAME_TRANSPORT = EnvBool(False)
 
 
     # VLM Item CUDA IPC Transport

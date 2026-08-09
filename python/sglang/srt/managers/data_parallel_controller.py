@@ -16,6 +16,7 @@
 import faulthandler
 import logging
 import multiprocessing as mp
+import pickle
 import signal
 import threading
 import time
@@ -594,10 +595,22 @@ class DataParallelController:
         self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
         self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
 
+    def _send_req(self, sock: zmq.Socket, req: Req):
+        """Send a request to a dp-rank scheduler, re-attaching any raw tensor
+        frames stashed by event_loop() (raw-frame mm transport, see
+        mm_utils.extract_tensor_frames) so tensor payloads are forwarded
+        without ever being re-pickled here. The small header is re-pickled
+        either way because dispatching mutates it (time_stats)."""
+        frames = req.__dict__.pop("_raw_frames", None)
+        if frames is None:
+            sock.send_pyobj(req)
+        else:
+            sock.send_multipart([pickle.dumps(req), *frames], copy=False)
+
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
             logger.debug(f"Direct routing to DP rank {req.routed_dp_rank}")
-            self.workers[req.routed_dp_rank].send_pyobj(req)
+            self._send_req(self.workers[req.routed_dp_rank], req)
             return True
         return False
 
@@ -608,7 +621,7 @@ class DataParallelController:
         while True:
             if self.status[self.round_robin_counter]:
                 logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                self._send_req(self.workers[self.round_robin_counter], req)
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
@@ -626,13 +639,13 @@ class DataParallelController:
             "prefill or decode instances; send to the router instead."
         )
         target_rank = req.bootstrap_room % len(self.workers)
-        self.workers[target_rank].send_pyobj(req)
+        self._send_req(self.workers[target_rank], req)
 
     def total_requests_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.workers[target_worker].send_pyobj(req)
+        self._send_req(self.workers[target_worker], req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -641,16 +654,27 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        self.workers[target_worker].send_pyobj(req)
+        self._send_req(self.workers[target_worker], req)
 
     def event_loop(self):
         while True:
             while True:
                 self.soft_watchdog.feed()
                 try:
-                    recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                    frames = self.recv_from_tokenizer.recv_multipart(
+                        zmq.NOBLOCK, copy=False
+                    )
                 except zmq.ZMQError:
                     break
+                # Raw-frame mm transport: unpickle the small header only
+                # (frame 0: request fields + input_ids); tensor payloads in
+                # frames[1:] stay opaque and are re-attached by _send_req().
+                # Single-frame (legacy) messages are byte-identical to
+                # recv_pyobj. Control/broadcast paths (send_to_all_workers,
+                # send_control_message) only ever see single-frame messages.
+                recv_req = pickle.loads(frames[0].buffer)
+                if len(frames) > 1:
+                    recv_req._raw_frames = frames[1:]
                 self._request_dispatcher(recv_req)
 
 

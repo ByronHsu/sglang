@@ -5,8 +5,10 @@ Multi-modality utils
 import copy
 import hashlib
 import pickle
+import warnings
 from abc import abstractmethod
 from collections import defaultdict
+from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -1655,6 +1657,197 @@ def wrap_shm_features(obj):
                 item.precomputed_embeddings = _wrap_tensor_or_list(
                     item.precomputed_embeddings
                 )
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Raw-frame ZMQ transport codec for multimodal tensors ("default" transport).
+#
+# In "default" tensor transport mode (forced whenever dist_init_addr is set),
+# mm feature tensors travel inside the pickled request, so every relay hop
+# (MultiTokenizerRouter, DataParallelController) unpickles and re-pickles
+# megabytes per image while holding the GIL. The codec below keeps tensor
+# payloads out of pickle entirely: ``extract_tensor_frames`` replaces each
+# raw CPU tensor with a small ``TensorFrameRef`` placeholder and returns the
+# raw buffers to be sent as separate ZMQ multipart frames; relays forward
+# those frames opaquely, and the scheduler entry rank rehydrates them
+# zero-copy via ``torch.frombuffer`` / ``np.frombuffer``.
+#
+# Wire format (one ZMQ message per request, discriminated by frame count):
+#   - 1 frame  -> legacy full ``pickle.dumps(obj)`` (exactly ``send_pyobj``).
+#   - N > 1    -> frame 0 is ``pickle.dumps(obj)`` with ``TensorFrameRef``
+#                 placeholders; frames 1..N-1 are the raw contiguous tensor
+#                 buffers, in ``frame_index`` order.
+#
+# Pure pack/unpack: no zmq dependency, unit-testable on CPU.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TensorFrameRef:
+    """Placeholder left inside a pickled request for a tensor that was moved
+    into a raw ZMQ multipart frame.
+
+    ``frame_index`` indexes the tensor-frame list handed to
+    ``rehydrate_tensor_frames`` (i.e. multipart frame ``frame_index + 1``;
+    frame 0 is the pickled request itself).
+    """
+
+    frame_index: int
+    shape: Tuple[int, ...]
+    dtype: Any  # torch.dtype for kind="torch", np.dtype for kind="numpy"
+    kind: str  # "torch" | "numpy"
+
+
+def _noop_restore():
+    pass
+
+
+def _extract_one(value, frames: List) -> Tuple[Any, bool]:
+    """Extract a single tensor into ``frames``.
+
+    Mirrors the predicate of the SHM path's ``_wrap_tensor_or_list`` (CPU
+    ``torch.Tensor``), plus ``np.ndarray``. Everything else — GPU tensors,
+    ``ShmPointerMMData`` / cuda-ipc proxies, scalars — is left untouched.
+    Returns ``(replacement, extracted)``.
+    """
+    if isinstance(value, torch.Tensor):
+        if not value.is_cpu or value.numel() == 0:
+            return value, False
+        try:
+            tensor = value.detach()
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
+            # A flat uint8 view works for every dtype (incl. bfloat16, which
+            # has no numpy equivalent) and is zero-copy for contiguous
+            # tensors; the ndarray keeps the tensor's storage alive for the
+            # duration of the (possibly deferred, copy=False) zmq send.
+            buffer = tensor.view(-1).view(torch.uint8).numpy()
+        except (RuntimeError, TypeError, ValueError) as e:
+            logger.debug("Raw-frame transport: skipping torch tensor: %s", e)
+            return value, False
+        ref = TensorFrameRef(len(frames), tuple(value.shape), value.dtype, "torch")
+        frames.append(buffer)
+        return ref, True
+    if isinstance(value, np.ndarray):
+        if value.size == 0 or value.dtype.hasobject:
+            return value, False
+        buffer = np.ascontiguousarray(value)
+        ref = TensorFrameRef(len(frames), tuple(value.shape), value.dtype, "numpy")
+        frames.append(buffer)
+        return ref, True
+    return value, False
+
+
+def _extract_value(value, frames: List) -> Tuple[Any, bool]:
+    """Extract a feature value (tensor, ndarray, or list/tuple thereof)."""
+    new_value, extracted = _extract_one(value, frames)
+    if extracted:
+        return new_value, True
+    if isinstance(value, (list, tuple)):
+        any_extracted = False
+        new_elems = []
+        for elem in value:
+            new_elem, elem_extracted = _extract_one(elem, frames)
+            any_extracted |= elem_extracted
+            new_elems.append(new_elem)
+        if not any_extracted:
+            return value, False
+        if isinstance(value, tuple):
+            return tuple(new_elems), True
+        return new_elems, True
+    return value, False
+
+
+def extract_tensor_frames(obj) -> Tuple[Optional[List], Callable[[], None]]:
+    """Pull raw CPU mm tensors out of ``obj.mm_inputs.mm_items`` for raw-frame
+    ZMQ transport.
+
+    Mutates ``obj`` in place, replacing each extracted tensor with a
+    ``TensorFrameRef``, and returns ``(frames, restore)``:
+
+    - ``frames``: buffers to send as multipart frames 1..N-1, in
+      ``frame_index`` order — or ``None`` if nothing was extracted (the
+      caller should send the legacy single-frame message).
+    - ``restore``: puts the original tensors back so the sender keeps using
+      an intact object after (or despite a failure of) the send. Call it in
+      a ``finally`` block.
+
+    No-op (returns ``(None, restore)``) for text-only requests, batch
+    requests, and objects whose tensors were already wrapped by the SHM /
+    cuda-ipc transports.
+    """
+    if not (hasattr(obj, "mm_inputs") and obj.mm_inputs):
+        return None, _noop_restore
+
+    frames: List = []
+    undo: List[Tuple[Any, str, Any]] = []
+
+    def restore():
+        for item, attr, original in undo:
+            setattr(item, attr, original)
+
+    try:
+        for item in obj.mm_inputs.mm_items:
+            for attr in ("feature", "precomputed_embeddings"):
+                value = getattr(item, attr, None)
+                if value is None:
+                    continue
+                new_value, extracted = _extract_value(value, frames)
+                if extracted:
+                    undo.append((item, attr, value))
+                    setattr(item, attr, new_value)
+    except BaseException:
+        restore()
+        raise
+
+    if not frames:
+        return None, _noop_restore
+    return frames, restore
+
+
+def _rehydrate_one(value, frames: List):
+    if not isinstance(value, TensorFrameRef):
+        return value
+    buffer = frames[value.frame_index]
+    if value.kind == "numpy":
+        return np.frombuffer(buffer, dtype=value.dtype).reshape(value.shape)
+    with warnings.catch_warnings():
+        # torch.frombuffer warns that the received buffer is read-only.
+        # That is fine: features are copied on .to(device) before any
+        # mutation, and hash_feature only reads.
+        warnings.filterwarnings("ignore", message="The given buffer is not writable")
+        tensor = torch.frombuffer(buffer, dtype=value.dtype)
+    return tensor.reshape(value.shape)
+
+
+def _rehydrate_value(value, frames: List):
+    if isinstance(value, TensorFrameRef):
+        return _rehydrate_one(value, frames)
+    if isinstance(value, (list, tuple)):
+        if not any(isinstance(elem, TensorFrameRef) for elem in value):
+            return value
+        new_elems = [_rehydrate_one(elem, frames) for elem in value]
+        return tuple(new_elems) if isinstance(value, tuple) else new_elems
+    return value
+
+
+def rehydrate_tensor_frames(obj, frames: List):
+    """Inverse of ``extract_tensor_frames``: replace every ``TensorFrameRef``
+    in ``obj.mm_inputs.mm_items`` with a tensor view over the raw frame
+    buffers (zero-copy; the tensors retain the buffers).
+
+    ``frames`` is the tensor-frame list only, i.e. multipart ``frames[1:]``
+    (frame 0 being the pickled request ``obj`` was loaded from).
+    """
+    if not (hasattr(obj, "mm_inputs") and obj.mm_inputs):
+        return obj
+    for item in obj.mm_inputs.mm_items:
+        for attr in ("feature", "precomputed_embeddings"):
+            value = getattr(item, attr, None)
+            if value is None:
+                continue
+            setattr(item, attr, _rehydrate_value(value, frames))
     return obj
 
 
