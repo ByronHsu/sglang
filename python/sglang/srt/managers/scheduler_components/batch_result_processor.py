@@ -89,6 +89,13 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
+                # The routed-experts merge in the router overlays prefill's
+                # prompt rows onto decode's full-length array, so decode must
+                # emit the key even when the request finished at prefill and
+                # never ran a decode forward. Collect before release_kv_cache
+                # frees the req_to_token slots get_topk reads.
+                self._maybe_collect_routed_experts(req)
+                self._maybe_collect_indexer_topk(req)
                 if self.server_args.enable_hisparse:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)

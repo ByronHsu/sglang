@@ -36,8 +36,15 @@ def maybe_wrap_ipv6_address(address: str) -> str:
 
 
 def _merge_routed_experts(prefill: dict, decode: dict):
-    if "routed_experts" not in prefill or "routed_experts" not in decode:
+    if "routed_experts" not in prefill:
         return False
+
+    if "routed_experts" not in decode:
+        # Decode quick-finishes without a decode forward when prefill samples
+        # the final token (EOS / length limit), so prefill's prompt rows are
+        # the complete answer.
+        decode["routed_experts"] = prefill["routed_experts"]
+        return True
 
     prefill_bytes = pybase64.b64decode(prefill["routed_experts"], validate=True)
     decode_bytes = pybase64.b64decode(decode["routed_experts"], validate=True)
