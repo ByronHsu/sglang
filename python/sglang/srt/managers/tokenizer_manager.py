@@ -76,11 +76,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import (
-    TensorTransportMode,
-    extract_tensor_frames,
-    wrap_shm_features,
-)
+from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -485,10 +481,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.disaggregation_mode = DisaggregationMode(
             self.server_args.disaggregation_mode
         )
-        # On prefill this is a BootstrapServerProcHandle for the dedicated
-        # bootstrap-server subprocess (or the in-thread server object when the
-        # SGLANG_DISABLE_BOOTSTRAP_SERVER_SUBPROCESS kill switch is set).
-        # Keep the reference so it is not garbage-collected.
+        # Keep a reference so the bootstrap server is not garbage-collected.
         self.bootstrap_server = start_disagg_service(self.server_args)
         # Single-source counter for auto-assigning fake bootstrap_room.
         self.fake_bootstrap_room_counter = 0
@@ -1295,35 +1288,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
-        # wrap_shm_features must run first: in cuda_ipc/SHM transport modes it
-        # replaces tensors with small proxies, so extract_tensor_frames below
-        # finds nothing and the message stays single-frame. The raw-frame path
-        # activates exactly where "default" transport pickles raw tensors.
         tokenized_obj = wrap_shm_features(tokenized_obj)
-        frames = restore = None
-        if not envs.SGLANG_DISABLE_MM_RAW_FRAME_TRANSPORT.get():
-            frames, restore = extract_tensor_frames(tokenized_obj)
-        if frames:
-            try:
-                # In multi-tokenizer mode send_to_scheduler is a SenderWrapper
-                # whose send_pyobj stamps http_worker_ipc for response
-                # routing; frame 0 is pickled here, so stamp before pickling.
-                stamp = getattr(self.send_to_scheduler, "stamp_http_worker_ipc", None)
-                if stamp is not None:
-                    stamp(tokenized_obj)
-                # Tensor payloads ride as separate raw frames that relay hops
-                # (MultiTokenizerRouter, DataParallelController) forward
-                # without unpickling. copy=False: zmq holds references to the
-                # extracted buffers, so restoring the tensors below is safe.
-                self.send_to_scheduler.send_multipart(
-                    [pickle.dumps(tokenized_obj), *frames], copy=False
-                )
-            finally:
-                # Put the original tensors back even if the send raised: the
-                # caller keeps using tokenized_obj (time_stats, retries).
-                restore()
-        else:
-            self.send_to_scheduler.send_pyobj(tokenized_obj)
+        self.send_to_scheduler.send_pyobj(tokenized_obj)
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
     def _send_batch_request(

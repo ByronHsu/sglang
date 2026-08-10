@@ -6,7 +6,6 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import Future, ThreadPoolExecutor
 from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, Union
 
@@ -185,18 +184,6 @@ class CommonKVManager(BaseKVManager):
             # fail to receive the KV indices from the decode instance of this request.
             # These timeout requests should be aborted to release the tree cache.
             self.bootstrap_timeout = envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
-            # Non-blocking /register_dp_rank: a small dedicated executor keeps
-            # the scheduler loop off the HTTP round-trip (up to 5s per POST),
-            # and pooled per-addr sessions reuse keep-alive connections
-            # (mirror of the decode-side session_pool below).
-            self.session_pool: Dict = defaultdict(requests.Session)
-            self.session_pool_lock = threading.Lock()
-            self.registration_executor = ThreadPoolExecutor(
-                max_workers=2, thread_name_prefix="dp-rank-reg"
-            )
-            self._registration_inflight = 0
-            self._registration_inflight_lock = threading.Lock()
-            self._registration_backlog_warned = False
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.enable_staging: bool = False
             self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
@@ -211,10 +198,6 @@ class CommonKVManager(BaseKVManager):
             # Heartbeat interval should be at least 2 seconds
             self.heartbeat_interval = max(
                 envs.SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL.get(), 2.0
-            )
-            # Heartbeat probe (connect, read) timeout should be at least 2 seconds
-            self.heartbeat_timeout = max(
-                envs.SGLANG_DISAGGREGATION_HEARTBEAT_TIMEOUT.get(), 2.0
             )
             # Heartbeat failure should be at least 1
             self.max_failures = max(
@@ -331,10 +314,6 @@ class CommonKVManager(BaseKVManager):
             )
 
         self._resolve_rank_mapping(info)
-        # A (re-)added prefill starts with a full heartbeat failure budget:
-        # a stale miss count from a previous kill must not let a single
-        # subsequent miss re-kill the recovered node.
-        self.heartbeat_failures.pop(bootstrap_addr, None)
         self.prefill_info_table[bootstrap_addr] = info
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
@@ -507,85 +486,6 @@ class CommonKVManager(BaseKVManager):
         logger.error(
             f"Prefill instance failed to register to bootstrap server after {max_retries} retries"
         )
-
-    @property
-    def bootstrap_dp_group(self) -> int:
-        """The dp group this rank occupies in the bootstrap server's tables.
-
-        Must match ``_handle_route_put``'s ``prefill_port_table`` keying:
-        without dp-attention, ``attn_dp_rank`` is pinned to 0 on every
-        replica, so plain-DP deployments key by ``system_dp_rank``. Room
-        registration (``/register_dp_rank``) must publish the same value or
-        decode pairs every dp>0 room with dp_group 0's transfer endpoint and
-        those rooms hang until the bootstrap timeout.
-        """
-        return self.attn_dp_rank if self.system_dp_size == 1 else self.system_dp_rank
-
-    # Warn when this many /register_dp_rank POSTs are queued on the
-    # registration executor (only plausible during a bootstrap-server outage;
-    # queued rooms still resolve or time out via the usual per-request paths).
-    REGISTRATION_BACKLOG_WARN_THRESHOLD = 1000
-
-    def register_dp_rank_async(
-        self, bootstrap_server_url: str, bootstrap_room: int, dp_rank: int
-    ) -> Future:
-        """Submit a pooled /register_dp_rank POST and return immediately.
-
-        Prefill side only. The scheduler loop must never block on this HTTP
-        round-trip: the decode side re-polls /query_dp_ranks on every
-        pop_preallocated pass, so a late registration only delays room
-        resolution by one poll, and a lost one surfaces through the existing
-        bootstrap/waiting timeouts — the same terminal behavior as the old
-        blocking POST's logged-and-dropped error.
-        """
-        with self._registration_inflight_lock:
-            self._registration_inflight += 1
-            inflight = self._registration_inflight
-        if inflight > self.REGISTRATION_BACKLOG_WARN_THRESHOLD:
-            if not self._registration_backlog_warned:
-                self._registration_backlog_warned = True
-                logger.warning(
-                    f"register_dp_rank backlog is {inflight} POSTs deep; the "
-                    f"bootstrap server at {bootstrap_server_url} is likely "
-                    "unreachable or overloaded."
-                )
-        else:
-            self._registration_backlog_warned = False
-        return self.registration_executor.submit(
-            self._register_dp_rank_blocking,
-            bootstrap_server_url,
-            bootstrap_room,
-            dp_rank,
-        )
-
-    def _register_dp_rank_blocking(
-        self, bootstrap_server_url: str, bootstrap_room: int, dp_rank: int
-    ):
-        """Executor worker for register_dp_rank_async: pooled blocking POST."""
-        try:
-            url = f"http://{bootstrap_server_url}/register_dp_rank"
-            payload = {
-                "bootstrap_room": bootstrap_room,
-                "dp_rank": dp_rank,
-            }
-            try:
-                with self.session_pool_lock:
-                    session = self.session_pool[bootstrap_server_url]
-                response = session.post(url, json=payload, timeout=5)
-                if response.status_code != 200:
-                    logger.error(
-                        f"Failed to register prefill dp_rank: {response.status_code}, {response.text}"
-                    )
-            except Exception as e:
-                # Drop the pooled session so a half-dead keep-alive connection
-                # is not reused (mirror of the decode-side heartbeat
-                # invalidation).
-                with self.session_pool_lock:
-                    self.session_pool.pop(bootstrap_server_url, None)
-                logger.error(f"Failed to register prefill dp_rank: {e}")
-        finally:
-            with self._registration_inflight_lock:
-                self._registration_inflight -= 1
 
     @cache
     def _connect(self, endpoint: str, is_ipv6: bool = False):
@@ -765,53 +665,48 @@ class CommonKVManager(BaseKVManager):
         def heartbeat_checker():
             while True:
                 time.sleep(self.heartbeat_interval)
-                self._heartbeat_check_once()
+                with self.connection_lock:
+                    addresses = list(self.prefill_info_table.keys())
+
+                for bootstrap_addr in addresses:
+                    session = None
+                    try:
+                        with self.session_pool_lock:
+                            session = self.session_pool[bootstrap_addr]
+                        response = session.get(
+                            f"http://{bootstrap_addr}/health",
+                            timeout=(2, 3),
+                            headers={"Connection": "keep-alive"},
+                        )
+                        if response.status_code == 200:
+                            self.heartbeat_failures[bootstrap_addr] = 0
+                            self._on_heartbeat_success(bootstrap_addr)
+                        else:
+                            logger.info(
+                                f"Attempting to reconnect to {bootstrap_addr}..."
+                            )
+                            self.heartbeat_failures[bootstrap_addr] = (
+                                self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                            )
+                            with self.session_pool_lock:
+                                if bootstrap_addr in self.session_pool:
+                                    del self.session_pool[bootstrap_addr]
+                    except Exception:
+                        logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
+                        self.heartbeat_failures[bootstrap_addr] = (
+                            self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                        )
+
+                    if (
+                        self.heartbeat_failures.get(bootstrap_addr, 0)
+                        >= self.max_failures
+                    ):
+                        self._handle_node_failure(bootstrap_addr)
+                        with self.session_pool_lock:
+                            if bootstrap_addr in self.session_pool:
+                                del self.session_pool[bootstrap_addr]
 
         threading.Thread(target=heartbeat_checker, daemon=True).start()
-
-    def _heartbeat_check_once(self):
-        """One probe sweep over all known prefill bootstrap addrs.
-
-        Known limit: probes run serially, so with many prefill addrs all
-        timing out one sweep can take n_addrs * heartbeat_timeout. That is
-        only pathological when everything is already down, so we accept it
-        for now instead of parallelizing the sweep.
-        """
-        with self.connection_lock:
-            addresses = list(self.prefill_info_table.keys())
-
-        for bootstrap_addr in addresses:
-            session = None
-            try:
-                with self.session_pool_lock:
-                    session = self.session_pool[bootstrap_addr]
-                response = session.get(
-                    f"http://{bootstrap_addr}/health",
-                    timeout=(self.heartbeat_timeout, self.heartbeat_timeout),
-                    headers={"Connection": "keep-alive"},
-                )
-                if response.status_code == 200:
-                    self.heartbeat_failures[bootstrap_addr] = 0
-                    self._on_heartbeat_success(bootstrap_addr)
-                else:
-                    logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
-                    self.heartbeat_failures[bootstrap_addr] = (
-                        self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                    )
-                    with self.session_pool_lock:
-                        if bootstrap_addr in self.session_pool:
-                            del self.session_pool[bootstrap_addr]
-            except Exception:
-                logger.info(f"Attempting to reconnect to {bootstrap_addr}...")
-                self.heartbeat_failures[bootstrap_addr] = (
-                    self.heartbeat_failures.get(bootstrap_addr, 0) + 1
-                )
-
-            if self.heartbeat_failures.get(bootstrap_addr, 0) >= self.max_failures:
-                self._handle_node_failure(bootstrap_addr)
-                with self.session_pool_lock:
-                    if bootstrap_addr in self.session_pool:
-                        del self.session_pool[bootstrap_addr]
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
         """Hook called on successful heartbeat. Override for backend-specific cleanup."""
@@ -826,10 +721,6 @@ class CommonKVManager(BaseKVManager):
             for k in keys_to_remove:
                 del self.connection_pool[k]
             self.prefill_info_table.pop(failed_bootstrap_addr, None)
-            # Reset the miss counter so that, when the addr is re-added by
-            # try_ensure_parallel_info, it gets a full max_failures budget
-            # instead of being re-killed by a single subsequent miss.
-            self.heartbeat_failures.pop(failed_bootstrap_addr, None)
 
             possible_affected_rooms = self.addr_to_rooms_tracker.get(
                 failed_bootstrap_addr, []
@@ -885,7 +776,7 @@ class CommonKVSender(BaseKVSender):
             if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.bootstrap_dp_group
+                self.kv_mgr.attn_dp_rank
                 != self.bootstrap_room % self.kv_mgr.server_args.dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
@@ -895,7 +786,7 @@ class CommonKVSender(BaseKVSender):
                     self.kv_mgr.record_failure(
                         self.bootstrap_room,
                         f"follow_bootstrap_room conflict: dispatched to dp_rank "
-                        f"{self.kv_mgr.bootstrap_dp_group} but bootstrap_room "
+                        f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
                         f"{self.bootstrap_room} implies dp_rank "
                         f"{self.bootstrap_room % self.kv_mgr.server_args.dp_size}. "
                         f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
@@ -905,16 +796,20 @@ class CommonKVSender(BaseKVSender):
                     return
 
     def _register_prefill_dp_rank(self):
-        """Register this request's prefill dp group to the bootstrap server.
-
-        Non-blocking: the POST runs on the manager's registration executor,
-        so the scheduler loop never stalls (up to 5s) on the HTTP round-trip.
-        """
-        self.kv_mgr.register_dp_rank_async(
-            self.bootstrap_server_url,
-            self.bootstrap_room,
-            self.kv_mgr.bootstrap_dp_group,
-        )
+        """Register this request's prefill dp_rank to the bootstrap server."""
+        url = f"http://{self.bootstrap_server_url}/register_dp_rank"
+        payload = {
+            "bootstrap_room": self.bootstrap_room,
+            "dp_rank": self.kv_mgr.attn_dp_rank,
+        }
+        try:
+            response = requests.post(url, json=payload, timeout=5)
+            if response.status_code != 200:
+                logger.error(
+                    f"Failed to register prefill dp_rank: {response.status_code}, {response.text}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to register prefill dp_rank: {e}")
 
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.num_kv_indices = num_kv_indices

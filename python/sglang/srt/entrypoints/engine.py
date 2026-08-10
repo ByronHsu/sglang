@@ -60,7 +60,6 @@ from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
-from sglang.srt.managers.disagg_service import BootstrapServerProcHandle
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -888,18 +887,6 @@ class Engine(EngineScoreMixin, EngineBase):
         names = [f"scheduler_{i}" for i in range(len(processes))]
         processes.extend(detoken_procs)
         names.extend(detoken_names)
-        # On prefill, the PD bootstrap server (control plane for P/D pairing)
-        # runs in a dedicated subprocess; monitor it so a crash takes the
-        # instance down instead of leaving a prefill that decode instances can
-        # no longer pair with. The handle lives on TokenizerManager
-        # (.bootstrap_server) or MultiTokenizerRouter
-        # (.disaggregation_bootstrap_server).
-        bootstrap_server = getattr(
-            tokenizer_manager, "bootstrap_server", None
-        ) or getattr(tokenizer_manager, "disaggregation_bootstrap_server", None)
-        if isinstance(bootstrap_server, BootstrapServerProcHandle):
-            processes.append(bootstrap_server.proc)
-            names.append("disagg_bootstrap_server")
         subprocess_watchdog = SubprocessWatchdog(
             processes=processes, process_names=names
         )

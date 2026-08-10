@@ -427,19 +427,7 @@ class MultiTokenizerRouter:
     async def router_worker_obj(self):
         """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
-            frames = await self.receive_from_worker.recv_multipart(copy=False)
-
-            if len(frames) > 1:
-                # Raw-frame mm transport (see mm_utils.extract_tensor_frames):
-                # tensor payloads ride in frames[1:]. Forward the whole
-                # message opaquely — zero deserialization, so this relay never
-                # holds the GIL to re-pickle tensors. All router-inspected
-                # message types (registration, pause/continue) are tensor-free
-                # and therefore always single-frame by construction.
-                await self.send_to_scheduler.send_multipart(frames, copy=False)
-                continue
-
-            recv_obj = pickle.loads(frames[0].buffer)
+            recv_obj = await self.receive_from_worker.recv_pyobj()
 
             if isinstance(recv_obj, TokenizerWorkerRegistration):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
@@ -756,18 +744,7 @@ class SenderWrapper:
         self.port_args = port_args
         self.send_to_scheduler = send_to_scheduler
 
-    def stamp_http_worker_ipc(self, obj):
-        """Mark the request with this worker's IPC name so responses can be
-        routed back to it."""
+    def send_pyobj(self, obj):
         if isinstance(obj, BaseReq):
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
-
-    def send_pyobj(self, obj):
-        self.stamp_http_worker_ipc(obj)
         self.send_to_scheduler.send_pyobj(obj)
-
-    def send_multipart(self, msg_parts, copy=False, **kwargs):
-        # Raw-frame mm transport passthrough: frame 0 is already pickled
-        # (with http_worker_ipc stamped by the caller, see
-        # TokenizerManager._send_one_request), so there is nothing to mutate.
-        return self.send_to_scheduler.send_multipart(msg_parts, copy=copy, **kwargs)

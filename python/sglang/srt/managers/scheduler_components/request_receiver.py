@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import pickle
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -24,7 +23,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.mm_utils import (
     has_shm_features,
-    rehydrate_tensor_frames,
     unwrap_shm_features,
 )
 from sglang.srt.utils import (
@@ -99,30 +97,11 @@ class SchedulerRequestReceiver:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
                 recv_reqs = []
 
-                # Raw-frame mm transport (see mm_utils.extract_tensor_frames)
-                # only ever arrives on a real zmq socket; the scripted
-                # runtime's ScriptedTokenizerRecvProxy keeps recv_pyobj.
-                is_zmq_socket = isinstance(self.recv_from_tokenizer, zmq.Socket)
-
                 while True:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break
-                        if is_zmq_socket:
-                            # Single-frame messages are exactly recv_pyobj
-                            # (recv + pickle.loads). Multi-frame messages
-                            # carry raw tensor buffers in frames[1:]; they
-                            # are rehydrated here — before
-                            # _broadcast_reqs_across_ranks — so the TP/CP
-                            # broadcast carries real tensors.
-                            frames = self.recv_from_tokenizer.recv_multipart(
-                                zmq.NOBLOCK
-                            )
-                            recv_req = pickle.loads(frames[0])
-                            if len(frames) > 1:
-                                recv_req = rehydrate_tensor_frames(recv_req, frames[1:])
-                        else:
-                            recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
+                        recv_req = self.recv_from_tokenizer.recv_pyobj(zmq.NOBLOCK)
                     except zmq.ZMQError:
                         break
                     recv_reqs.append(recv_req)

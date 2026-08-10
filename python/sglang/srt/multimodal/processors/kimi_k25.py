@@ -1,8 +1,5 @@
-import asyncio
-import functools
 import math
 import re
-import threading
 from collections import defaultdict
 from typing import Dict, List, Union
 
@@ -237,9 +234,6 @@ class KimiGPUProcessorWrapper:
         self._image_mean = image_mean
         self._image_std = image_std
         self._gpu_norm_tensors = None
-        # process_and_combine_mm_data may run on multiple io_executor threads
-        # concurrently; guard the lazy norm-tensor init against double init.
-        self._gpu_norm_lock = threading.Lock()
 
         # Explicitly expose attributes that base class process_mm_data needs:
         # - image_processor: checked via isinstance(..., BaseImageProcessor)
@@ -329,18 +323,13 @@ class KimiGPUProcessorWrapper:
 
     def _get_gpu_norm_tensors(self, device="cuda"):
         if self._gpu_norm_tensors is None:
-            with self._gpu_norm_lock:
-                if self._gpu_norm_tensors is None:
-                    image_mean = torch.tensor(
-                        self._image_mean, device=device, dtype=torch.float32
-                    ).view(1, 3, 1, 1)
-                    image_std_inv = (
-                        1.0
-                        / torch.tensor(
-                            self._image_std, device=device, dtype=torch.float32
-                        )
-                    ).view(1, 3, 1, 1)
-                    self._gpu_norm_tensors = (image_mean, image_std_inv)
+            image_mean = torch.tensor(
+                self._image_mean, device=device, dtype=torch.float32
+            ).view(1, 3, 1, 1)
+            image_std_inv = (
+                1.0 / torch.tensor(self._image_std, device=device, dtype=torch.float32)
+            ).view(1, 3, 1, 1)
+            self._gpu_norm_tensors = (image_mean, image_std_inv)
         return self._gpu_norm_tensors
 
 
@@ -393,15 +382,8 @@ class KimiK2_5VLImageProcessor(KimiGridMMDataMixin, SGLangBaseProcessor):
             multimodal_tokens=self.mm_tokens,
         )
 
-        # Offload the synchronous HF preprocessing (resize/normalize, potentially
-        # seconds per many-image request) to the io_executor thread pool so the
-        # tokenizer-worker event loop stays responsive (ZMQ IPC, health checks).
-        loop = asyncio.get_running_loop()
-        mm_items, input_ids, _ = await loop.run_in_executor(
-            self.io_executor,
-            functools.partial(
-                self.process_and_combine_mm_data, base_output, self.mm_tokens
-            ),
+        mm_items, input_ids, _ = self.process_and_combine_mm_data(
+            base_output, self.mm_tokens
         )
 
         return MultimodalProcessorOutput(
