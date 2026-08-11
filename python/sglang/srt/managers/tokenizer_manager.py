@@ -76,7 +76,11 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqOutput,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
-from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
+from sglang.srt.managers.mm_utils import (
+    TensorTransportMode,
+    extract_tensor_frames,
+    wrap_shm_features,
+)
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.managers.scheduler_input_blocker import input_blocker_guard_region
@@ -1288,8 +1292,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
     ):
         tokenized_obj.time_stats.set_api_server_dispatch_time()
+        # wrap_shm_features runs first: in cuda_ipc/SHM modes it has already
+        # replaced tensors with proxies, so extract_tensor_frames is a no-op
+        # and the message stays single-frame.
         tokenized_obj = wrap_shm_features(tokenized_obj)
-        self.send_to_scheduler.send_pyobj(tokenized_obj)
+        frames = restore = None
+        if not envs.SGLANG_DISABLE_MM_RAW_FRAME_TRANSPORT.get():
+            frames, restore = extract_tensor_frames(tokenized_obj)
+        if frames:
+            try:
+                if self.server_args.tokenizer_worker_num == 1:
+                    self.send_to_scheduler.send_multipart(
+                        [pickle.dumps(tokenized_obj), *frames], copy=False
+                    )
+                else:
+                    self.send_to_scheduler.send_multipart(tokenized_obj, frames)
+            finally:
+                restore()
+        else:
+            self.send_to_scheduler.send_pyobj(tokenized_obj)
         tokenized_obj.time_stats.set_api_server_dispatch_finish_time()
 
     def _send_batch_request(

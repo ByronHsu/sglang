@@ -639,6 +639,9 @@ class Envs:
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.
     SGLANG_MM_AVOID_RETOKENIZE = EnvBool(True)
+    # Kill switch for the raw-frame zmq transport of multimodal tensors.
+    # Sender-side only; receivers always accept both wire formats.
+    SGLANG_DISABLE_MM_RAW_FRAME_TRANSPORT = EnvBool(False)
 
 
     # VLM Item CUDA IPC Transport

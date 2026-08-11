@@ -5,8 +5,10 @@ Multi-modality utils
 import copy
 import hashlib
 import pickle
+import warnings
 from abc import abstractmethod
 from collections import defaultdict
+from dataclasses import dataclass
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -1655,6 +1657,121 @@ def wrap_shm_features(obj):
                 item.precomputed_embeddings = _wrap_tensor_or_list(
                     item.precomputed_embeddings
                 )
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Raw-frame ZMQ transport for multimodal tensors ("default" transport mode).
+#
+# Keeps mm tensor payloads out of pickle so relay hops (MultiTokenizerRouter,
+# DataParallelController) never re-pickle megabytes per image under the GIL.
+# Wire format, discriminated by frame count: 1 frame = legacy pickle.dumps
+# (send_pyobj), used by all control and non-mm messages; N > 1 = frame 0 is
+# the pickled request with each tensor replaced by a TensorFrameRef, frames
+# 1..N-1 are the raw tensor buffers, sent zero-copy.
+#
+# Only CPU torch.Tensor values in mm_item.feature are extracted (the
+# production shape); everything else stays inside the pickled header.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TensorFrameRef:
+    """Placeholder for a tensor moved into raw multipart frame
+    ``frame_index + 1`` (frame 0 is the pickled request)."""
+
+    frame_index: int
+    shape: Tuple[int, ...]
+    dtype: Any  # torch.dtype
+
+
+def _noop_restore():
+    pass
+
+
+def _extract_feature(value, frames: List) -> Tuple[Any, bool]:
+    """Move a CPU torch.Tensor into ``frames``; leave anything else alone."""
+    if not isinstance(value, torch.Tensor):
+        if isinstance(value, (np.ndarray, list, tuple)):
+            # Unsupported payloads stay on the slow pickle path; log so they
+            # are observable rather than a silent perf regression.
+            logger.debug(
+                "Raw-frame transport: skipping unsupported feature type %s",
+                type(value).__name__,
+            )
+        return value, False
+    if not value.is_cpu or value.numel() == 0:
+        return value, False
+    try:
+        tensor = value.detach()
+        if not tensor.is_contiguous():
+            tensor = tensor.contiguous()
+        # Flat uint8 view: works for every dtype (incl. bfloat16, which has
+        # no numpy equivalent) and keeps the tensor's storage alive for the
+        # zero-copy zmq send.
+        buffer = tensor.view(-1).view(torch.uint8).numpy()
+    except (RuntimeError, TypeError, ValueError) as e:
+        logger.debug("Raw-frame transport: skipping torch tensor: %s", e)
+        return value, False
+    ref = TensorFrameRef(len(frames), tuple(value.shape), value.dtype)
+    frames.append(buffer)
+    return ref, True
+
+
+def extract_tensor_frames(obj) -> Tuple[Optional[List], Callable[[], None]]:
+    """Replace CPU mm feature tensors in ``obj`` with TensorFrameRefs.
+
+    Returns ``(frames, restore)``: the buffers to send as multipart frames
+    1..N-1, or ``None`` if nothing was extracted (send legacy single-frame);
+    ``restore()`` puts the original tensors back and must run after the send
+    (``finally``), so the caller keeps using an intact object.
+    """
+    if not (hasattr(obj, "mm_inputs") and obj.mm_inputs):
+        return None, _noop_restore
+
+    frames: List = []
+    undo: List[Tuple[Any, Any]] = []
+
+    def restore():
+        for item, original in undo:
+            item.feature = original
+
+    try:
+        for item in obj.mm_inputs.mm_items:
+            value = item.feature
+            if value is None:
+                continue
+            new_value, extracted = _extract_feature(value, frames)
+            if extracted:
+                undo.append((item, value))
+                item.feature = new_value
+    except BaseException:
+        restore()
+        raise
+
+    if not frames:
+        return None, _noop_restore
+    return frames, restore
+
+
+def _rehydrate_feature(value: TensorFrameRef, frames: List) -> torch.Tensor:
+    buffer = frames[value.frame_index]
+    with warnings.catch_warnings():
+        # The received buffer is read-only, which is fine: features are
+        # copied on .to(device) before any mutation.
+        warnings.filterwarnings("ignore", message="The given buffer is not writable")
+        tensor = torch.frombuffer(buffer, dtype=value.dtype)
+    return tensor.reshape(value.shape)
+
+
+def rehydrate_tensor_frames(obj, frames: List):
+    """Inverse of ``extract_tensor_frames``. ``frames`` is multipart
+    ``frames[1:]``; the rebuilt tensors are zero-copy views over them."""
+    if not (hasattr(obj, "mm_inputs") and obj.mm_inputs):
+        return obj
+    for item in obj.mm_inputs.mm_items:
+        if isinstance(item.feature, TensorFrameRef):
+            item.feature = _rehydrate_feature(item.feature, frames)
     return obj
 
 

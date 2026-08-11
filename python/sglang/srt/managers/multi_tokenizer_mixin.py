@@ -427,7 +427,16 @@ class MultiTokenizerRouter:
     async def router_worker_obj(self):
         """Forward path: workers → scheduler, with pause/continue broadcast."""
         while True:
-            recv_obj = await self.receive_from_worker.recv_pyobj()
+            frames = await self.receive_from_worker.recv_multipart(copy=False)
+
+            if len(frames) > 1:
+                # Raw-frame mm transport: forward opaquely, never re-pickle
+                # tensor payloads. Router-inspected message types
+                # (registration, pause/continue) are always single-frame.
+                await self.send_to_scheduler.send_multipart(frames, copy=False)
+                continue
+
+            recv_obj = pickle.loads(frames[0].buffer)
 
             if isinstance(recv_obj, TokenizerWorkerRegistration):
                 if recv_obj.worker_ipc_name not in self.all_worker_ipcs:
@@ -744,7 +753,17 @@ class SenderWrapper:
         self.port_args = port_args
         self.send_to_scheduler = send_to_scheduler
 
-    def send_pyobj(self, obj):
+    def stamp_http_worker_ipc(self, obj):
+        """Mark the request with this worker's IPC name for response routing."""
         if isinstance(obj, BaseReq):
             obj.http_worker_ipc = self.port_args.tokenizer_ipc_name
+
+    def send_pyobj(self, obj):
+        self.stamp_http_worker_ipc(obj)
         self.send_to_scheduler.send_pyobj(obj)
+
+    def send_multipart(self, obj, frames):
+        self.stamp_http_worker_ipc(obj)
+        return self.send_to_scheduler.send_multipart(
+            [pickle.dumps(obj), *frames], copy=False
+        )
