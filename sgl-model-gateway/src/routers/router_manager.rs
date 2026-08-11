@@ -31,7 +31,7 @@ use crate::{
         rerank::RerankRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{http::pd_types::PDRankRouting, RouterTrait},
+    routers::RouterTrait,
     server::ServerConfig,
 };
 
@@ -496,7 +496,6 @@ impl RouterTrait for RouterManager {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
-        pd_rank_routing: PDRankRouting,
     ) -> Response {
         // In IGW mode, resolve model_id and fail fast if not resolvable
         // In non-IGW mode, pass through to router (router handles validation)
@@ -514,12 +513,7 @@ impl RouterTrait for RouterManager {
 
         if let Some(router) = router {
             router
-                .route_generate(
-                    headers,
-                    body,
-                    effective_model_id.as_deref().or(model_id),
-                    pd_rank_routing,
-                )
+                .route_generate(headers, body, effective_model_id.as_deref().or(model_id))
                 .await
         } else {
             (

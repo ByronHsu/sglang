@@ -73,16 +73,15 @@ class TransferInfo:
     required_dst_info_num: int
     dst_state_indices: List[List[int]]
     decode_prefix_len: Optional[int] = None  # for decode radix cache
-    is_dummy_participant: Optional[bool] = None
     # NOTE: optional staging field; populated via STAGING_RSP. Keep at the
     # end so positional construction in from_zmq() continues to work.
     staging: Optional["StagingTransferInfo"] = None
 
     def is_dummy(self):
-        if self.is_dummy_participant is not None:
-            return self.is_dummy_participant
-        # Legacy peers infer dummy status from an empty destination. Preserve
-        # decode-radix full-hit semantics when decode_prefix_len is available.
+        # A transfer is "dummy" only for CP non-authoritative ranks.
+        # When dst_kv_indices is empty due to a decode-side radix cache
+        # full hit (decode_prefix_len > 0), the transfer is NOT dummy --
+        # aux/state data still needs to be sent.
         return self.dst_kv_indices.size == 0 and not self.decode_prefix_len
 
     @classmethod
@@ -102,11 +101,6 @@ class TransferInfo:
             dst_state_indices=dst_state_indices,
             decode_prefix_len=(
                 int(msg[8].decode("ascii")) if len(msg) > 8 and msg[8] != b"" else None
-            ),
-            is_dummy_participant=(
-                bool(int(msg[9].decode("ascii")))
-                if len(msg) > 9 and msg[9] != b""
-                else None
             ),
         )
 
@@ -2258,8 +2252,7 @@ class NixlKVManager(CommonKVManager):
             transfer_info.is_dummy(),
             len(transfer_info.dst_state_indices),
         )
-        if not self.record_decode_prefix_len(room, decode_prefix_len):
-            return
+        self.req_to_decode_prefix_len[room] = decode_prefix_len
         with self._peer_lock:
             participant_count = len(self.transfer_infos.get(room, {}))
         if participant_count == required_dst_info_num:
@@ -2493,7 +2486,6 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.required_dst_info_num).encode("ascii"),
                         packed_state_indices,
                         str(decode_prefix_len or 0).encode("ascii"),
-                        str(int(is_dummy)).encode("ascii"),
                     ]
                 )
 

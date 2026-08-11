@@ -34,76 +34,7 @@ pub fn api_path(url: &str, api_path: &str) -> String {
     }
 }
 
-use serde::{Deserialize, Serialize};
-
-use crate::protocols::generate::GenerateRequest;
-
-/// Stage-specific data-parallel ranks for a prefill-decode request.
-///
-/// `routed_dp_rank` remains supported as the legacy single-rank contract.
-/// When either stage-specific field is omitted, the PD router falls back to
-/// that legacy rank for the corresponding stage.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PDRankRouting {
-    pub prefill: Option<usize>,
-    pub decode: Option<usize>,
-    pub legacy: Option<usize>,
-}
-
-/// `/generate` request with optional asymmetric PD data-parallel ranks.
-///
-/// The wrapper keeps the public protocol extension local to the HTTP entry
-/// point; downstream workers receive a normal `GenerateRequest` with only the
-/// rank appropriate for their stage.
-#[derive(Deserialize)]
-pub struct PDGenerateRequest {
-    #[serde(flatten)]
-    pub request: GenerateRequest,
-    #[serde(default)]
-    pub routed_prefill_dp_rank: Option<usize>,
-    #[serde(default)]
-    pub routed_decode_dp_rank: Option<usize>,
-    #[serde(default)]
-    pub routed_dp_rank: Option<usize>,
-}
-
-impl PDGenerateRequest {
-    pub fn rank_routing(&self) -> PDRankRouting {
-        PDRankRouting {
-            prefill: self.routed_prefill_dp_rank,
-            decode: self.routed_decode_dp_rank,
-            legacy: self.routed_dp_rank,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn test_pd_generate_request_extracts_stage_and_legacy_ranks() {
-        let request: PDGenerateRequest = serde_json::from_value(json!({
-            "text": "hello",
-            "routed_prefill_dp_rank": 3,
-            "routed_decode_dp_rank": 41,
-            "routed_dp_rank": 7,
-        }))
-        .unwrap();
-
-        assert_eq!(request.request.text.as_deref(), Some("hello"));
-        assert_eq!(
-            request.rank_routing(),
-            PDRankRouting {
-                prefill: Some(3),
-                decode: Some(41),
-                legacy: Some(7),
-            }
-        );
-    }
-}
+use serde::Serialize;
 
 /// Optimized bootstrap wrapper for single requests.
 #[derive(Serialize)]

@@ -48,8 +48,6 @@ from sglang.srt.utils.network import (
 
 logger = logging.getLogger(__name__)
 
-DECODE_RADIX_TRANSFER_PROTOCOL_VERSION = 1
-
 
 class KVTransferError(Exception):
     def __init__(
@@ -77,7 +75,6 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
-    disagg_transfer_protocol_version: int = 0
 
     # Pre-computed rank mapping (set by try_ensure_parallel_info on decode side)
     target_tp_rank: Optional[int] = None
@@ -97,9 +94,6 @@ class PrefillServerInfo:
             str(self.kv_cache_dtype) if self.kv_cache_dtype is not None else None
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
-        self.disagg_transfer_protocol_version = int(
-            self.disagg_transfer_protocol_version
-        )
 
 
 @dataclasses.dataclass
@@ -232,31 +226,6 @@ class CommonKVManager(BaseKVManager):
                     self.request_status[bootstrap_room], status
                 )
 
-    def record_decode_prefix_len(
-        self, bootstrap_room: int, decode_prefix_len: int
-    ) -> bool:
-        """Record and validate the prefix agreed on by all transfer participants."""
-        existing = self.req_to_decode_prefix_len.get(bootstrap_room)
-        if existing is not None and existing != decode_prefix_len:
-            reason = (
-                "Decode radix prefix length mismatch for bootstrap_room="
-                f"{bootstrap_room}: existing={existing}, incoming={decode_prefix_len}. "
-                "All decode transfer participants must report the same prefix length."
-            )
-            logger.error(reason)
-            self.record_failure(bootstrap_room, reason)
-            self.update_status(bootstrap_room, KVPoll.Failed)
-            return False
-
-        self.req_to_decode_prefix_len[bootstrap_room] = decode_prefix_len
-        logger.debug(
-            "PD decode-radix trace: prefill_record_decode_prefix_len room=%s "
-            "decode_prefix_len=%s",
-            bootstrap_room,
-            decode_prefix_len,
-        )
-        return True
-
     def record_failure(self, bootstrap_room: int, failure_reason: str):
         with self.failure_lock:
             self.failure_records[bootstrap_room] = failure_reason
@@ -299,18 +268,6 @@ class CommonKVManager(BaseKVManager):
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
                 f"but decode server has kv_cache_dtype={self.server_args.kv_cache_dtype}. "
                 f"Both servers must use the same --kv-cache-dtype value."
-            )
-
-        if (
-            self.server_args.disaggregation_decode_enable_radix_cache
-            and info.disagg_transfer_protocol_version
-            < DECODE_RADIX_TRANSFER_PROTOCOL_VERSION
-        ):
-            raise RuntimeError(
-                "Prefill server does not advertise decode-radix transfer protocol "
-                f"version {DECODE_RADIX_TRANSFER_PROTOCOL_VERSION}. Disable "
-                "--disaggregation-decode-enable-radix-cache or upgrade the "
-                "prefill server."
             )
 
         self._resolve_rank_mapping(info)
@@ -454,9 +411,6 @@ class CommonKVManager(BaseKVManager):
             "page_size": self.kv_args.page_size,
             "kv_cache_dtype": self.server_args.kv_cache_dtype,
             "load_balance_method": self.server_args.load_balance_method,
-            "disagg_transfer_protocol_version": (
-                DECODE_RADIX_TRANSFER_PROTOCOL_VERSION
-            ),
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -1196,7 +1150,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
-        self.disagg_transfer_protocol_version: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
@@ -1263,9 +1216,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         rank_port = int(data["rank_port"])
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
-        disagg_transfer_protocol_version = int(
-            data.get("disagg_transfer_protocol_version", 0)
-        )
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1290,15 +1240,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 "load_balance_method", "follow_bootstrap_room"
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
-
-        if self.disagg_transfer_protocol_version is None:
-            self.disagg_transfer_protocol_version = disagg_transfer_protocol_version
-        else:
-            # Report the oldest participant so mixed-version prefills fail closed.
-            self.disagg_transfer_protocol_version = min(
-                self.disagg_transfer_protocol_version,
-                disagg_transfer_protocol_version,
-            )
 
         if system_dp_size == 1:
             dp_group = attn_dp_rank
@@ -1362,9 +1303,6 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
                     else True
-                ),
-                disagg_transfer_protocol_version=(
-                    self.disagg_transfer_protocol_version or 0
                 ),
             )
             return web.json_response(dataclasses.asdict(info), status=200)

@@ -30,7 +30,7 @@ use crate::{
         generate::GenerateRequest,
         responses::{ResponsesGetParams, ResponsesRequest},
     },
-    routers::{http::pd_types::PDRankRouting, RouterTrait},
+    routers::RouterTrait,
 };
 
 /// gRPC router implementation for SGLang
@@ -379,7 +379,6 @@ impl RouterTrait for GrpcRouter {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
-        _pd_rank_routing: PDRankRouting,
     ) -> Response {
         self.route_generate_impl(headers, body, model_id).await
     }

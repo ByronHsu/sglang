@@ -1479,8 +1479,7 @@ class MooncakeKVManager(CommonKVManager):
                         transfer_info.is_dummy,
                         len(transfer_info.dst_state_indices),
                     )
-                    if not self.record_decode_prefix_len(room, decode_prefix_len):
-                        continue
+                    self.req_to_decode_prefix_len[room] = decode_prefix_len
                     # NOTE: after bootstrapping we can mark the req as waiting for input
                     if len(self.transfer_infos[room]) == required_dst_info_num:
                         self.update_status(room, KVPoll.WaitingForInput)

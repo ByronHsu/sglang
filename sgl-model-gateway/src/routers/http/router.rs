@@ -38,7 +38,6 @@ use crate::{
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
         header_utils,
-        http::pd_types::PDRankRouting,
         streaming_utils::BreakerTrackedStream,
         RouterTrait,
     },
@@ -752,7 +751,6 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
         model_id: Option<&str>,
-        _pd_rank_routing: PDRankRouting,
     ) -> Response {
         self.route_typed_request(headers, body, "/generate", model_id)
             .await
