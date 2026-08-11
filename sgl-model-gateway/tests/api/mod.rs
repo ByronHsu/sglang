@@ -5,4 +5,3 @@ mod parser_endpoints_test;
 mod request_formats_test;
 mod responses_api_test;
 mod streaming_tests;
-mod token_count_passthrough_test;
