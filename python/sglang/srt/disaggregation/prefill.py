@@ -562,6 +562,9 @@ class SchedulerDisaggregationPrefillMixin:
             batch=batch,
             logits_output=logits_output,
         )
+        self.batch_result_processor.materialize_sampling_mask_output(
+            len(batch.reqs), logits_output
+        )
 
         def advance_logprob_pt(i: int, req: Req) -> None:
             nonlocal logprob_pt
@@ -607,6 +610,33 @@ class SchedulerDisaggregationPrefillMixin:
                         advance_logprob_pt(i, req)
                         continue
 
+                sampling_mask_finish_reason = (
+                    self.batch_result_processor.get_sampling_mask_finish_reason(
+                        i, req, logits_output
+                    )
+                )
+                if sampling_mask_finish_reason is not None:
+                    self.clear_pending_chunk_send(req)
+                    prepare_abort(
+                        req,
+                        sampling_mask_finish_reason.message,
+                        status_code=sampling_mask_finish_reason.status_code,
+                    )
+                    req.time_stats.trace_ctx.abort(
+                        abort_info={"reason": sampling_mask_finish_reason.message}
+                    )
+                    req.disagg_kv_sender.abort()
+                    maybe_release_metadata_buffer(
+                        req, self.req_to_metadata_buffer_idx_allocator
+                    )
+                    req.pending_bootstrap = False
+                    if self.enable_hicache_storage:
+                        self.tree_cache.release_aborted_request(req.rid)
+                    release_kv_cache(req, self.tree_cache, is_insert=False)
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    advance_logprob_pt(i, req)
+                    continue
+
                 req.output_ids.append(next_token_id)
                 maybe_cache_unfinished_req(req, self.tree_cache)
                 self.disagg_prefill_inflight_queue.append(req)
@@ -633,6 +663,10 @@ class SchedulerDisaggregationPrefillMixin:
                         logits_output,
                     )
                     logprob_pt += num_input_logprobs
+                if req.return_sampling_mask:
+                    self.batch_result_processor.add_sampling_mask_return_values(
+                        i, req, logits_output
+                    )
                 self.send_kv_chunk(req, last_chunk=True)
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 

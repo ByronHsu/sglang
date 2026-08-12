@@ -7,10 +7,15 @@ from torch import nn
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
+    get_attention_cp_group,
     get_attention_tp_group,
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+    SamplingMaskStatus,
+)
 from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
@@ -64,13 +69,17 @@ SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPRO
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
+_SamplingMaskData = Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
+
 
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self.tp_sync_group = get_tp_group().device_group
+        self.cp_sync_group = None
         if is_dp_attention_enabled():
             self.tp_sync_group = get_attention_tp_group().device_group
+            self.cp_sync_group = get_attention_cp_group().device_group
 
         true_on_policy = resolve_true_on_policy_runtime_policy(get_global_server_args())
         # In RL on-policy mode, deterministic inference is automatically enabled.
@@ -80,6 +89,9 @@ class Sampler(nn.Module):
         # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
         self.use_log_softmax_logprob = true_on_policy.enabled
         self.use_ascend_backend = get_global_server_args().sampling_backend == "ascend"
+        self.sampling_mask_max_tokens = (
+            get_global_server_args().sampling_mask_max_tokens
+        )
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -116,6 +128,21 @@ class Sampler(nn.Module):
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
+        return_sampling_mask = any(sampling_info.return_sampling_masks or [])
+        sampling_mask_data = None
+        sampling_mask_batch_indices = None
+        if return_sampling_mask:
+            sampling_mask_batch_indices = torch.tensor(
+                [
+                    i
+                    for i, should_return in enumerate(
+                        sampling_info.return_sampling_masks or []
+                    )
+                    if should_return
+                ],
+                dtype=torch.long,
+                device=logits.device,
+            )
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -176,8 +203,12 @@ class Sampler(nn.Module):
                 logits[:] = torch.softmax(logits, dim=-1)
                 probs = logits
 
-                batch_next_token_ids = self._sample_from_probs(
-                    probs, sampling_info, positions, simple_sampling_case
+                batch_next_token_ids, sampling_mask_data = self._sample_from_probs(
+                    probs,
+                    sampling_info,
+                    positions,
+                    simple_sampling_case,
+                    sampling_mask_batch_indices,
                 )
                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
                     logprobs = (
@@ -202,6 +233,22 @@ class Sampler(nn.Module):
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
 
+        if return_sampling_mask:
+            assert sampling_mask_batch_indices is not None
+            if sampling_info.is_all_greedy:
+                logits_output.sampling_mask_output = (
+                    self._build_greedy_sampling_mask_output(
+                        sampling_mask_batch_indices, batch_next_token_ids
+                    )
+                )
+            else:
+                # Request admission guarantees sampling-mask rows take a
+                # producer path above rather than unfiltered log-prob sampling.
+                assert sampling_mask_data is not None
+                logits_output.sampling_mask_output = self._build_sampling_mask_output(
+                    batch_next_token_ids, sampling_mask_data
+                )
+
         return batch_next_token_ids
 
     def _sample_from_probs(
@@ -210,18 +257,26 @@ class Sampler(nn.Module):
         sampling_info: SamplingBatchInfo,
         positions: torch.Tensor,
         simple_sampling_case: bool,
-    ) -> torch.Tensor:
+        sampling_mask_batch_indices: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[_SamplingMaskData]]:
         """Sample from probability distribution (after softmax).
 
         Used for standard sampling with flashinfer/pytorch backends.
         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
         """
+        sampling_mask_data = None
         if simple_sampling_case:
             batch_next_token_ids = sampling_from_probs_torch(
                 probs,
                 sampling_seed=sampling_info.sampling_seed,
                 positions=positions,
             )
+            if sampling_mask_batch_indices is not None:
+                sampling_mask_data = (
+                    sampling_mask_batch_indices,
+                    probs.index_select(0, sampling_mask_batch_indices),
+                    None,
+                )
         else:
             backend = get_global_server_args().sampling_backend
             if backend == "flashinfer":
@@ -234,6 +289,26 @@ class Sampler(nn.Module):
                     batch_next_token_ids = min_p_sampling_from_probs(
                         probs, sampling_info.min_ps
                     )
+                    if sampling_mask_batch_indices is not None:
+                        requested_probs = probs.index_select(
+                            0, sampling_mask_batch_indices
+                        )
+                        requested_min_ps = sampling_info.min_ps.index_select(
+                            0, sampling_mask_batch_indices
+                        )
+                        min_p_thresholds = (
+                            requested_probs.max(dim=-1).values * requested_min_ps
+                        )
+                        requested_probs = torch.where(
+                            requested_probs >= min_p_thresholds.view(-1, 1),
+                            requested_probs,
+                            torch.zeros_like(requested_probs),
+                        )
+                        sampling_mask_data = (
+                            sampling_mask_batch_indices,
+                            requested_probs,
+                            None,
+                        )
                 else:
                     batch_next_token_ids = top_k_top_p_sampling_from_probs(
                         probs.contiguous(),
@@ -241,9 +316,35 @@ class Sampler(nn.Module):
                         sampling_info.top_ps,
                         filter_apply_order="joint",
                     )
+                    if sampling_mask_batch_indices is not None:
+                        requested_probs = probs.index_select(
+                            0, sampling_mask_batch_indices
+                        )
+                        requested_top_ks = sampling_info.top_ks.index_select(
+                            0, sampling_mask_batch_indices
+                        )
+                        requested_top_ps = sampling_info.top_ps.index_select(
+                            0, sampling_mask_batch_indices
+                        )
+                        top_k_probs = top_k_renorm_prob(
+                            requested_probs, requested_top_ks
+                        )
+                        top_p_probs = top_p_renorm_prob(
+                            requested_probs, requested_top_ps
+                        )
+                        requested_probs = torch.where(
+                            (top_k_probs > 0) & (top_p_probs > 0),
+                            requested_probs,
+                            torch.zeros_like(requested_probs),
+                        )
+                        sampling_mask_data = (
+                            sampling_mask_batch_indices,
+                            requested_probs,
+                            None,
+                        )
             elif backend == "pytorch":
                 # A slower fallback implementation with torch native operations.
-                batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
+                sample_result = top_k_top_p_min_p_sampling_from_probs_torch(
                     probs,
                     sampling_info.top_ks,
                     sampling_info.top_ps,
@@ -251,10 +352,139 @@ class Sampler(nn.Module):
                     sampling_info.need_min_p_sampling,
                     sampling_info.sampling_seed,
                     positions,
+                    return_filtered_probs=sampling_mask_batch_indices is not None,
                 )
+                if sampling_mask_batch_indices is None:
+                    batch_next_token_ids = sample_result
+                else:
+                    batch_next_token_ids, filtered_probs, token_ids = sample_result
+                    sampling_mask_data = (
+                        sampling_mask_batch_indices,
+                        filtered_probs.index_select(0, sampling_mask_batch_indices),
+                        token_ids.index_select(0, sampling_mask_batch_indices),
+                    )
             else:
                 raise ValueError(f"Invalid sampling backend: {backend}")
-        return batch_next_token_ids
+        return batch_next_token_ids, sampling_mask_data
+
+    def _build_greedy_sampling_mask_output(
+        self,
+        batch_indices: torch.Tensor,
+        batch_next_token_ids: torch.Tensor,
+    ) -> SamplingMaskOutput:
+        token_ids = batch_next_token_ids.index_select(0, batch_indices).to(torch.int32)
+        num_requests = batch_indices.numel()
+        return SamplingMaskOutput(
+            batch_indices=batch_indices.to(torch.int32),
+            token_ids=token_ids.view(-1, 1),
+            lengths=torch.ones(
+                num_requests, dtype=torch.int32, device=token_ids.device
+            ),
+            selected_logprobs=torch.zeros(
+                num_requests, dtype=torch.float32, device=token_ids.device
+            ),
+            statuses=torch.full(
+                (num_requests,),
+                SamplingMaskStatus.OK,
+                dtype=torch.int32,
+                device=token_ids.device,
+            ),
+        )
+
+    def _build_sampling_mask_output(
+        self,
+        batch_next_token_ids: torch.Tensor,
+        sampling_mask_data: _SamplingMaskData,
+    ) -> SamplingMaskOutput:
+        """Pack exact positive sampling weights into a bounded tensor result.
+
+        Sampling has already happened. This method converts:
+
+            sampled token + filtered sampler weights
+        into a bounded GPU result containing:
+            support token IDs + support length + selected-token log q(y) + status
+        """
+        batch_indices, weights, token_ids = sampling_mask_data
+        sampled_tokens = (
+            batch_next_token_ids.index_select(0, batch_indices).long().view(-1, 1)
+        )
+
+        if token_ids is None:
+            selected_weights = torch.gather(weights, 1, sampled_tokens).squeeze(1)
+        else:
+            sampled_matches = token_ids.long() == sampled_tokens
+            selected_weights = torch.where(
+                sampled_matches, weights, torch.zeros_like(weights)
+            ).sum(dim=-1)
+
+        weights_float = weights.float()
+        support_mass = weights_float.sum(dim=-1)
+        lengths = (weights > 0).sum(dim=-1, dtype=torch.int32)
+        selected_weights = selected_weights.float()
+        selected_logprobs = torch.log(selected_weights / support_mass)
+
+        invalid = (
+            (selected_weights <= 0)
+            | (support_mass <= 0)
+            | ~torch.isfinite(selected_logprobs)
+        )
+        overflow = lengths > self.sampling_mask_max_tokens
+        statuses = torch.where(
+            invalid,
+            SamplingMaskStatus.INVALID,
+            torch.where(
+                overflow,
+                SamplingMaskStatus.OVERFLOW,
+                SamplingMaskStatus.OK,
+            ),
+        ).to(torch.int32)
+
+        # Status changes scheduler control flow, so every TP/CP replica serving
+        # the request must make the same decision. Invalid takes precedence over
+        # overflow because its status value is larger.
+        if dist.is_initialized():
+            if dist.get_world_size(self.tp_sync_group) > 1:
+                dist.all_reduce(
+                    statuses, op=dist.ReduceOp.MAX, group=self.tp_sync_group
+                )
+            if (
+                self.cp_sync_group is not None
+                and dist.get_world_size(self.cp_sync_group) > 1
+            ):
+                dist.all_reduce(
+                    statuses, op=dist.ReduceOp.MAX, group=self.cp_sync_group
+                )
+
+        packed_size = min(self.sampling_mask_max_tokens, weights.shape[-1])
+        _, packed_positions = torch.topk(
+            weights, k=packed_size, dim=-1, largest=True, sorted=True
+        )
+        if token_ids is None:
+            packed_token_ids = packed_positions.to(torch.int32)
+        else:
+            packed_token_ids = torch.gather(token_ids, 1, packed_positions).to(
+                torch.int32
+            )
+
+        successful = statuses == SamplingMaskStatus.OK
+        packed_token_ids = torch.where(
+            successful.view(-1, 1),
+            packed_token_ids,
+            torch.zeros_like(packed_token_ids),
+        )
+        selected_logprobs = torch.where(
+            successful,
+            selected_logprobs,
+            torch.zeros_like(selected_logprobs),
+        )
+
+        return SamplingMaskOutput(
+            batch_indices=batch_indices.to(torch.int32),
+            token_ids=packed_token_ids,
+            lengths=lengths,
+            selected_logprobs=selected_logprobs,
+            statuses=statuses,
+        )
 
     def _sample_from_logprobs(
         self,
@@ -480,6 +710,7 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     need_min_p_sampling: bool,
     sampling_seed: Optional[torch.Tensor],
     positions: torch.Tensor,
+    return_filtered_probs: bool = False,
 ):
     """
     A top-k, top-p and min-p sampling implementation with native pytorch operations.
@@ -510,13 +741,16 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
         # For now, we use log to the modified probs to get logprobs, but for numerical
         # stability, we'd better come up with a solution to use log_softmax.
         logprobs = probs_sort.to(torch.float64)  # Using float64 for numerical stability
-        del probs_sort
+        if not return_filtered_probs:
+            del probs_sort
         logprobs.log_()
         sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
 
     # int32 range is enough to represent the token ids
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
+    if return_filtered_probs:
+        return batch_next_token_ids, probs_sort, probs_idx
     return batch_next_token_ids
 
 

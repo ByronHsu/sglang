@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -15,9 +16,13 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskStatus,
+)
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
     Req,
     ScheduleBatch,
 )
@@ -214,6 +219,7 @@ class SchedulerBatchResultProcessor:
             # Move next_token_ids and logprobs to cpu
             next_token_ids = next_token_ids.tolist()
             self.move_logprobs_to_cpu(batch=batch, logits_output=logits_output)
+            self.materialize_sampling_mask_output(len(batch.reqs), logits_output)
 
             self._validate_pp_skip_output_comm(batch, result)
 
@@ -223,6 +229,9 @@ class SchedulerBatchResultProcessor:
             logprob_pt = 0
 
             for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
+                sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
+                    i, req, logits_output
+                )
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
                     continue
@@ -230,23 +239,32 @@ class SchedulerBatchResultProcessor:
                 if req.inflight_middle_chunks <= 0:
                     req.time_stats.set_prefill_finished_time()
 
-                    # req output_ids are set here
-                    req.output_ids.append(next_token_id)
-
-                    self._maybe_update_reasoning_tokens(req, next_token_id)
-
-                    req.update_finish_state()
+                    if sampling_mask_finish_reason is not None:
+                        req.to_finish = sampling_mask_finish_reason
+                    else:
+                        # req output_ids are set here
+                        req.output_ids.append(next_token_id)
+                        self._maybe_update_reasoning_tokens(req, next_token_id)
+                    req.update_finish_state(
+                        0 if sampling_mask_finish_reason is not None else 1
+                    )
                     if req.finished():
-                        self._maybe_collect_routed_experts(req)
-                        self._maybe_collect_indexer_topk(req)
-                        release_kv_cache(req, self.tree_cache)
+                        if sampling_mask_finish_reason is None:
+                            self._maybe_collect_routed_experts(req)
+                            self._maybe_collect_indexer_topk(req)
+                        release_kv_cache(
+                            req,
+                            self.tree_cache,
+                            is_insert=sampling_mask_finish_reason is None,
+                        )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.server_args.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
-                    self._maybe_collect_customized_info(i, req, logits_output)
+                    if sampling_mask_finish_reason is None:
+                        self._maybe_collect_customized_info(i, req, logits_output)
 
                     if batch.return_logprob:
                         logprob_pt = self._apply_prefill_logprobs(
@@ -257,7 +275,14 @@ class SchedulerBatchResultProcessor:
                             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
                             next_token_ids=next_token_ids,
                             logprob_pt=logprob_pt,
+                            store=sampling_mask_finish_reason is None,
                         )
+
+                    if sampling_mask_finish_reason is not None:
+                        continue
+
+                    if req.return_sampling_mask:
+                        self.add_sampling_mask_return_values(i, req, logits_output)
 
                     if (
                         req.return_hidden_states
@@ -400,6 +425,7 @@ class SchedulerBatchResultProcessor:
         extend_logprob_start_len_per_req: Optional[List[int]],
         next_token_ids: List[int],
         logprob_pt: int,
+        store: bool,
     ) -> int:
         assert extend_logprob_start_len_per_req is not None
         assert extend_input_len_per_req is not None
@@ -412,7 +438,7 @@ class SchedulerBatchResultProcessor:
             extend_logprob_start_len,
         )
 
-        if req.return_logprob:
+        if store and req.return_logprob:
             self.logprob_result_processor.add_logprob_return_values(
                 i,
                 req,
@@ -613,6 +639,7 @@ class SchedulerBatchResultProcessor:
             result.next_token_ids,
             result.can_run_cuda_graph,
         )
+        self.materialize_sampling_mask_output(len(batch.reqs), logits_output)
 
         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
             batch=batch,
@@ -650,7 +677,7 @@ class SchedulerBatchResultProcessor:
             if is_spec_v1:
                 req.time_stats.set_last_decode_finish_time()
                 self._handle_finish_state_updated_req(
-                    req, batch, result, i, logits_output
+                    req, batch, result, i, logits_output, commit_output=True
                 )
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
@@ -662,19 +689,34 @@ class SchedulerBatchResultProcessor:
 
             # Non-spec and V2: full post-processing
             next_token_id = next_token_ids[i]
-            new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
-                req.output_ids.append(next_token_id)
-            else:
-                req.output_ids.extend(next_token_id)
-                new_accepted_len = len(next_token_id)
-
-            self._maybe_update_reasoning_tokens(req, next_token_id)
-
             req.time_stats.set_last_decode_finish_time()
+            sampling_mask_finish_reason = self.get_sampling_mask_finish_reason(
+                i, req, logits_output
+            )
+            if sampling_mask_finish_reason is not None:
+                req.to_finish = sampling_mask_finish_reason
+                new_accepted_len = 0
+            else:
+                new_accepted_len = 1
+                if batch.spec_algorithm.is_none():
+                    req.output_ids.append(next_token_id)
+                else:
+                    req.output_ids.extend(next_token_id)
+                    new_accepted_len = len(next_token_id)
+                self._maybe_update_reasoning_tokens(req, next_token_id)
             req.update_finish_state(new_accepted_len)
 
-            self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
+            self._handle_finish_state_updated_req(
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                commit_output=sampling_mask_finish_reason is None,
+            )
+
+            if sampling_mask_finish_reason is not None:
+                continue
 
             if req.return_logprob:
                 self._apply_decode_logprobs(
@@ -685,6 +727,11 @@ class SchedulerBatchResultProcessor:
                     next_token_logprobs=next_token_logprobs,
                     logits_output=logits_output,
                 )
+
+            if req.return_sampling_mask:
+                # return_sampling_mask + speculative decoding is rejected at
+                # request entry, so this remains one support mask per token.
+                self.add_sampling_mask_return_values(i, req, logits_output)
 
             if req.return_hidden_states and logits_output.hidden_states is not None:
                 req.hidden_states.append(
@@ -810,6 +857,84 @@ class SchedulerBatchResultProcessor:
             self.abort_request(AbortReq(rid=req.rid))
         req.grammar.finished = req.finished()
 
+    def add_sampling_mask_return_values(
+        self,
+        i: int,
+        req: Req,
+        output: LogitsProcessorOutput,
+    ) -> None:
+        """Attach sparse sampling support metadata to the return values."""
+        mask = output.next_token_sampling_mask_idx
+        logprobs = output.next_token_sampling_logprobs
+        req.output_token_sampling_mask.append(None if mask is None else mask[i])
+        req.output_token_sampling_logprobs.append(
+            None if logprobs is None else logprobs[i]
+        )
+
+    @staticmethod
+    def materialize_sampling_mask_output(
+        batch_size: int,
+        output: Optional[LogitsProcessorOutput],
+    ) -> None:
+        if output is None or output.sampling_mask_output is None:
+            return
+
+        sampling_output = output.sampling_mask_output
+        batch_indices = sampling_output.batch_indices.tolist()
+        token_ids = sampling_output.token_ids.tolist()
+        lengths = sampling_output.lengths.tolist()
+        selected_logprobs = sampling_output.selected_logprobs.tolist()
+        statuses = sampling_output.statuses.tolist()
+
+        masks = [None] * batch_size
+        logprobs = [None] * batch_size
+        status_by_batch = [None] * batch_size
+        packed_width = sampling_output.token_ids.shape[1]
+        for row, batch_index in enumerate(batch_indices):
+            batch_index = int(batch_index)
+            status = int(statuses[row])
+            length = int(lengths[row])
+            if status == SamplingMaskStatus.OK and length > packed_width:
+                status = SamplingMaskStatus.INVALID
+            status_by_batch[batch_index] = status
+            if status == SamplingMaskStatus.OK:
+                masks[batch_index] = token_ids[row][:length]
+                logprobs[batch_index] = float(selected_logprobs[row])
+
+        output.next_token_sampling_mask_idx = masks
+        output.next_token_sampling_logprobs = logprobs
+        output.next_token_sampling_mask_status = status_by_batch
+        output.sampling_mask_output = None
+
+    def get_sampling_mask_finish_reason(
+        self,
+        i: int,
+        req: Req,
+        output: Optional[LogitsProcessorOutput],
+    ) -> Optional[FINISH_ABORT]:
+        if not req.return_sampling_mask:
+            return None
+        assert output is not None
+        statuses = output.next_token_sampling_mask_status
+        status = None if statuses is None else statuses[i]
+        if status == SamplingMaskStatus.OK:
+            return None
+        if status == SamplingMaskStatus.OVERFLOW:
+            return FINISH_ABORT(
+                "Sampling mask support exceeds --sampling-mask-max-tokens="
+                f"{self.server_args.sampling_mask_max_tokens}. Adjust top_k, "
+                "top_p, or min_p to reduce support, or increase the server limit.",
+                HTTPStatus.BAD_REQUEST,
+                "BadRequestError",
+            )
+        assert status in (None, SamplingMaskStatus.INVALID)
+        return FINISH_ABORT(
+            "The sampling backend selected a token outside its captured sampling "
+            "support.",
+            HTTPStatus.INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+        )
+
     def _handle_finish_state_updated_req(
         self,
         req: Req,
@@ -817,13 +942,16 @@ class SchedulerBatchResultProcessor:
         result: GenerationBatchResult,
         i: int,
         logits_output: LogitsProcessorOutput,
+        commit_output: bool,
     ):
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
-        self._mamba_prefix_cache_update(req, batch, result, i)
+        if commit_output:
+            self._mamba_prefix_cache_update(req, batch, result, i)
 
         if (
-            self.server_args.disaggregation_decode_enable_offload_kvcache
+            commit_output
+            and self.server_args.disaggregation_decode_enable_offload_kvcache
             and not req.finished()
         ):
             self.decode_offload_manager.offload_kv_cache(req)
@@ -832,10 +960,14 @@ class SchedulerBatchResultProcessor:
             # delete feature to save memory
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
-            self._maybe_collect_routed_experts(req)
-            self._maybe_collect_indexer_topk(req)
+            if commit_output:
+                self._maybe_collect_routed_experts(req)
+                self._maybe_collect_indexer_topk(req)
 
-            if self.server_args.disaggregation_decode_enable_offload_kvcache:
+            if (
+                commit_output
+                and self.server_args.disaggregation_decode_enable_offload_kvcache
+            ):
                 # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                 if not self.decode_offload_manager.offload_kv_cache(req):
                     self.decode_offload_manager.finalize_release_on_finish(req)
@@ -847,7 +979,7 @@ class SchedulerBatchResultProcessor:
                 )
                 if callable(prepare_release):
                     prepare_release(req)
-                is_insert = (
+                is_insert = commit_output and (
                     req.mamba_lazy_is_insert
                     if get_global_server_args().enable_mamba_extra_buffer_lazy()
                     else True
@@ -856,7 +988,8 @@ class SchedulerBatchResultProcessor:
 
             req.time_stats.set_completion_time()
 
-        self._maybe_collect_customized_info(i, req, logits_output)
+        if commit_output:
+            self._maybe_collect_customized_info(i, req, logits_output)
 
     def _maybe_update_reasoning_tokens(
         self,

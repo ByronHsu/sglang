@@ -795,6 +795,7 @@ class ServerArgs:
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
     enable_return_indexer_topk: bool = False
+    sampling_mask_max_tokens: int = 4096
     enable_deepseek_v4_fp4_indexer: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
@@ -4426,6 +4427,21 @@ class ServerArgs:
             )
 
     def _handle_other_validations(self):
+        if self.sampling_mask_max_tokens <= 0:
+            raise ValueError(
+                "--sampling-mask-max-tokens must be positive "
+                f"(got {self.sampling_mask_max_tokens})."
+            )
+        if self.disaggregation_mode != "null":
+            disagg_sampling_mask_capacity = (
+                envs.SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS.get()
+            )
+            if disagg_sampling_mask_capacity > 0:
+                self.sampling_mask_max_tokens = min(
+                    self.sampling_mask_max_tokens,
+                    disagg_sampling_mask_capacity,
+                )
+
         # Handle optimistic prefill validation
         if (
             self.optimistic_prefill_retries > 0
@@ -6853,6 +6869,15 @@ class ServerArgs:
             "--enable-return-indexer-topk",
             action="store_true",
             help="Enable returning indexer topk indices of layers with indexer with responses.",
+        )
+        parser.add_argument(
+            "--sampling-mask-max-tokens",
+            type=int,
+            default=ServerArgs.sampling_mask_max_tokens,
+            help=(
+                "Maximum token IDs returned for one sampling support. "
+                "The request fails if its realized support exceeds this limit."
+            ),
         )
         parser.add_argument(
             "--enable-deepseek-v4-fp4-indexer",

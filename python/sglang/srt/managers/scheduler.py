@@ -235,6 +235,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import PortArgs, ServerArgs, get_global_server_args
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
@@ -1950,6 +1951,7 @@ class Scheduler(
                 return_logprob=recv_req.return_logprob,
                 top_logprobs_num=recv_req.top_logprobs_num,
                 token_ids_logprob=recv_req.token_ids_logprob,
+                return_sampling_mask=recv_req.return_sampling_mask,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 input_embeds=recv_req.input_embeds,
@@ -2051,6 +2053,70 @@ class Scheduler(
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+
+        if (
+            req.return_sampling_mask
+            and self.disaggregation_mode != DisaggregationMode.NULL
+            and not self.disagg_metadata_buffers.enable_sampling_mask
+        ):
+            error_msg = (
+                "return_sampling_mask with disaggregation requires "
+                "SGLANG_DISAGGREGATION_SAMPLING_MASK_MAX_TOKENS > 0."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        uses_sampling_truncation = (
+            req.sampling_params.top_k != TOP_K_ALL
+            or req.sampling_params.top_p < 1.0
+            or req.sampling_params.min_p > 0.0
+        )
+        if req.return_sampling_mask and not uses_sampling_truncation:
+            error_msg = (
+                "return_sampling_mask cannot return the full vocabulary; set "
+                "top_p < 1, a finite top_k, or min_p > 0."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if req.return_sampling_mask and req.custom_logit_processor is not None:
+            error_msg = (
+                "return_sampling_mask is not supported with custom logit processors."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        if req.return_sampling_mask and not self.spec_algorithm.is_none():
+            # Spec workers do not emit one sampling support per accepted token, so
+            # the returned mask would not align 1:1 with generated tokens. Reject
+            # the combination instead of silently returning a misaligned mask.
+            error_msg = (
+                "return_sampling_mask is not supported with speculative decoding."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
+        sampling_backend = self.server_args.sampling_backend
+        if req.return_sampling_mask and (
+            use_mlx() or sampling_backend not in {"flashinfer", "pytorch"}
+        ):
+            unsupported_backend = "mlx" if use_mlx() else sampling_backend
+            error_msg = (
+                "return_sampling_mask is not supported with the "
+                f"{unsupported_backend} sampling backend."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -3073,10 +3139,18 @@ class Scheduler(
                                 else batch_result.next_token_ids
                             )
                             self.future_map.stash(future_indices, stash_payload)
-                            batch_result.copy_to_cpu(
-                                return_logprob=batch.return_logprob,
-                                return_hidden_states=batch.return_hidden_states,
-                            )
+                            if torch.version.hip is not None:
+                                batch_result.copy_to_cpu(
+                                    return_logprob=batch.return_logprob,
+                                    return_hidden_states=batch.return_hidden_states,
+                                )
+                            else:
+                                self.copy_stream.wait_stream(self.forward_stream)
+                                with self.copy_stream_ctx:
+                                    batch_result.copy_to_cpu(
+                                        return_logprob=batch.return_logprob,
+                                        return_hidden_states=batch.return_hidden_states,
+                                    )
                         else:
                             batch_result.future_indices = future_indices
 
@@ -3210,10 +3284,18 @@ class Scheduler(
             self.future_map.stash(
                 batch_result.future_indices, batch_result.next_token_ids
             )
-            batch_result.copy_to_cpu(
-                return_logprob=self.cur_batch.return_logprob,
-                return_hidden_states=self.cur_batch.return_hidden_states,
-            )
+            if torch.version.hip is not None:
+                batch_result.copy_to_cpu(
+                    return_logprob=self.cur_batch.return_logprob,
+                    return_hidden_states=self.cur_batch.return_hidden_states,
+                )
+            else:
+                self.copy_stream.wait_stream(self.forward_stream)
+                with self.copy_stream_ctx:
+                    batch_result.copy_to_cpu(
+                        return_logprob=self.cur_batch.return_logprob,
+                        return_hidden_states=self.cur_batch.return_hidden_states,
+                    )
 
         # Release the closure and large GPU tensors that are no longer needed.
         # The delay_sample_func closure captures forward_batch (which holds

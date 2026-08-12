@@ -9,7 +9,10 @@ import torch
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.eplb.expert_distribution import ExpertDistributionMetrics
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    SamplingMaskOutput,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.state_capturer.base import TopkCaptureOutput
@@ -20,6 +23,16 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _async_d2h(t: torch.Tensor) -> torch.Tensor:
+    """Copy a tensor to CPU without serializing the CUDA producer stream."""
+    if not t.is_cuda:
+        return t.to("cpu", non_blocking=True)
+    cpu_t = torch.empty(t.shape, dtype=t.dtype, pin_memory=True)
+    cpu_t.copy_(t, non_blocking=True)
+    t.record_stream(torch.cuda.current_stream(t.device))
+    return cpu_t
 
 
 @dataclasses.dataclass
@@ -79,42 +92,46 @@ class GenerationBatchResult:
         """
         if return_logprob:
             if self.logits_output.next_token_logprobs is not None:
-                self.logits_output.next_token_logprobs = (
-                    self.logits_output.next_token_logprobs.to("cpu", non_blocking=True)
+                self.logits_output.next_token_logprobs = _async_d2h(
+                    self.logits_output.next_token_logprobs
                 )
             if self.logits_output.input_token_logprobs is not None:
-                self.logits_output.input_token_logprobs = (
-                    self.logits_output.input_token_logprobs.to("cpu", non_blocking=True)
+                self.logits_output.input_token_logprobs = _async_d2h(
+                    self.logits_output.input_token_logprobs
                 )
             if self.logits_output.next_token_top_logprobs_val is not None:
                 self.logits_output.next_token_top_logprobs_val = [
-                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_top_logprobs_val
                 ]
             if self.logits_output.next_token_top_logprobs_idx is not None:
                 self.logits_output.next_token_top_logprobs_idx = [
-                    x.to("cpu", non_blocking=True) if torch.is_tensor(x) else x
+                    _async_d2h(x) if torch.is_tensor(x) else x
                     for x in self.logits_output.next_token_top_logprobs_idx
                 ]
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
                 self.logits_output.next_token_token_ids_logprobs_val = [
-                    v.to("cpu", non_blocking=True) if torch.is_tensor(v) else v
+                    _async_d2h(v) if torch.is_tensor(v) else v
                     for v in self.logits_output.next_token_token_ids_logprobs_val
                 ]
         if return_hidden_states and self.logits_output.hidden_states is not None:
-            self.logits_output.hidden_states = self.logits_output.hidden_states.to(
-                "cpu", non_blocking=True
+            self.logits_output.hidden_states = _async_d2h(
+                self.logits_output.hidden_states
             )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        self.next_token_ids = _async_d2h(self.next_token_ids)
 
         if self.accept_lens is not None:
-            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+            self.accept_lens = _async_d2h(self.accept_lens)
 
         if self.routed_experts_output is not None:
             self.routed_experts_output.copy_to_cpu()
 
         if self.indexer_topk_output is not None:
             self.indexer_topk_output.copy_to_cpu()
+
+        sampling_mask_output = getattr(self.logits_output, "sampling_mask_output", None)
+        if sampling_mask_output is not None:
+            sampling_mask_output.map_device_tensors(_async_d2h)
 
         if (x := self.expert_distribution_metrics) is not None:
             x.copy_to_cpu()
@@ -176,6 +193,7 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
 
     logits_output = result.logits_output
     assert logits_output is not None
+    sampling_mask_output = logits_output.sampling_mask_output
 
     return {
         "extend_input_len_per_req": result.extend_input_len_per_req,
@@ -185,6 +203,23 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
         "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
         "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
         "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
+        "sampling_mask_batch_indices": (
+            None if sampling_mask_output is None else sampling_mask_output.batch_indices
+        ),
+        "sampling_mask_token_ids": (
+            None if sampling_mask_output is None else sampling_mask_output.token_ids
+        ),
+        "sampling_mask_lengths": (
+            None if sampling_mask_output is None else sampling_mask_output.lengths
+        ),
+        "sampling_mask_selected_logprobs": (
+            None
+            if sampling_mask_output is None
+            else sampling_mask_output.selected_logprobs
+        ),
+        "sampling_mask_statuses": (
+            None if sampling_mask_output is None else sampling_mask_output.statuses
+        ),
         "input_token_logprobs": result.logits_output.input_token_logprobs,
         "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
         "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
@@ -196,6 +231,15 @@ def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
 def get_logprob_from_pp_outputs(
     next_pp_outputs: PPProxyTensors,
 ) -> tuple[LogitsProcessorOutput, list[int], list[int]]:
+    sampling_mask_output = None
+    if next_pp_outputs["sampling_mask_batch_indices"] is not None:
+        sampling_mask_output = SamplingMaskOutput(
+            batch_indices=next_pp_outputs["sampling_mask_batch_indices"],
+            token_ids=next_pp_outputs["sampling_mask_token_ids"],
+            lengths=next_pp_outputs["sampling_mask_lengths"],
+            selected_logprobs=next_pp_outputs["sampling_mask_selected_logprobs"],
+            statuses=next_pp_outputs["sampling_mask_statuses"],
+        )
     logits_output = LogitsProcessorOutput(
         # Do not send logits and hidden states because they are large
         next_token_logits=None,
@@ -209,6 +253,7 @@ def get_logprob_from_pp_outputs(
         next_token_token_ids_logprobs_idx=next_pp_outputs[
             "next_token_token_ids_logprobs_idx"
         ],
+        sampling_mask_output=sampling_mask_output,
         input_token_logprobs=next_pp_outputs["input_token_logprobs"],
         input_top_logprobs_val=next_pp_outputs["input_top_logprobs_val"],
         input_top_logprobs_idx=next_pp_outputs["input_top_logprobs_idx"],
