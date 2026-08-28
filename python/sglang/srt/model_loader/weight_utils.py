@@ -1341,11 +1341,13 @@ def row_parallel_weight_loader(
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
+def sharded_weight_loader(
+    shard_axis: int, rank_getter: Callable[[], int] | None = None
+) -> LoaderFunction:
     """Create a weight loader that shards the weights along the given axis"""
 
     def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
-        tp_rank = get_attention_tp_rank()
+        tp_rank = rank_getter() if rank_getter is not None else get_attention_tp_rank()
 
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size

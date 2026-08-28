@@ -35,6 +35,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         cache_indices: torch.Tensor,
         num_v_heads: int,
         head_v_dim: int,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         """Packed decode fast path: feed the conv-1d output ``mixed_qkv``
@@ -63,6 +64,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
+            lower_bound=lower_bound,
         )
         # [B, 1, HV, V] -> [1, B, HV, V] view to match existing decode layout.
         return out.transpose(0, 1)
@@ -80,6 +82,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
+        lower_bound: Optional[float] = None,
         **kwargs,
     ) -> torch.Tensor:
         return fused_sigmoid_gating_delta_rule_update(
@@ -97,6 +100,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             softplus_beta=1.0,
             softplus_threshold=20.0,
             is_kda=True,
+            lower_bound=lower_bound,
         )
 
     def extend(
@@ -113,8 +117,13 @@ class TritonKDAKernel(LinearAttnKernelBase):
         A_log: Optional[torch.Tensor] = None,
         dt_bias: Optional[torch.Tensor] = None,
         lower_bound: Optional[float] = None,
+        beta_is_raw: bool = False,
+        output_intermediate_states: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        ssm_cache_indices = torch.where(
+            cache_indices >= 0, cache_indices, ssm_states.shape[0] - 1
+        ).to(torch.int32)
         return chunk_kda(
             q=q,
             k=k,
@@ -122,10 +131,12 @@ class TritonKDAKernel(LinearAttnKernelBase):
             g=g,
             beta=beta,
             initial_state=ssm_states,
-            initial_state_indices=cache_indices,
+            initial_state_indices=ssm_cache_indices,
             use_qk_l2norm_in_kernel=True,
             cu_seqlens=query_start_loc,
             A_log=A_log,
             dt_bias=dt_bias,
             lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
+            output_intermediate_states=output_intermediate_states,
         )

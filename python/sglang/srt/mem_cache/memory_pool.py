@@ -617,6 +617,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
+    def copy_mamba_state(
+        self, src_index: torch.Tensor, dst_index: torch.Tensor
+    ) -> None:
+        if src_index.numel() == 0:
+            return
+        if (
+            self.layer_transfer_counter is not None
+            and self.layer_transfer_counter.consumer_index >= 0
+        ):
+            last_mamba_layer = max(self.mamba_map)
+            self.layer_transfer_counter.wait_until(last_mamba_layer - self.start_layer)
+        self.mamba_pool.copy_from(src_index, dst_index)
+
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
 
@@ -633,14 +646,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             return mamba_next_track_idx
 
     def get_mamba_ping_pong_keep_idx(self, req: "Req") -> int:
-        """Return the ping-pong index holding the most recent tracked state.
-
-        In lazy mode the valid state stays at next_track_idx (no eager swap).
-        In normal mode it is at the "other" index (swapped after each track).
-        """
-        if self.enable_mamba_extra_buffer_lazy:
-            return req.mamba_next_track_idx
-        return self.get_mamba_ping_pong_other_idx(req.mamba_next_track_idx)
+        """Return the ping-pong index holding the most recent tracked state."""
+        return req.mamba_last_track_idx
 
     def _alloc_ping_pong_buffer(self, req: "Req"):
         """Allocate the ping-pong track buffer for a new request.
@@ -667,6 +674,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         buf[:n] = slots
         req.mamba_ping_pong_track_buffer = buf
         req.mamba_next_track_idx = 0
+        req.mamba_last_track_idx = (
+            0
+            if self.enable_mamba_extra_buffer_lazy
+            else self.get_mamba_ping_pong_other_idx(0)
+        )
 
     def set_mamba_ping_pong_slot(self, req: "Req", idx: int, value):
         """Update a ping-pong slot value and sync the device-side mapping.
@@ -687,8 +699,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         Returns the old slot index (shape [1]) for cache insertion and
         replaces it with new_slot so the request can continue tracking.
-        In lazy mode the valid state is at next_track_idx; in normal mode
-        it is at the "other" index.
         """
         donate_idx = self.get_mamba_ping_pong_keep_idx(req)
         mamba_value_donated = (
@@ -755,6 +765,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             # tensor on the req side while the new pool slot leaks).
             req.mamba_ping_pong_track_buffer = None
             req.mamba_next_track_idx = None
+            req.mamba_last_track_idx = None
 
     def clear(self):
         logger.info("Reset HybridReqToTokenPool")
@@ -851,10 +862,12 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         raise NotImplementedError()
 
     def maybe_get_custom_mem_pool(self):
@@ -1595,6 +1608,14 @@ class HybridLinearKVPool(KVCache):
         use_mla: bool = False,
         kv_lora_rank: int = None,
         qk_rope_head_dim: int = None,
+        use_dsa: bool = False,
+        index_head_dim: Optional[int] = None,
+        kv_cache_dim: Optional[int] = None,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        tail_extra_slots: int = 0,
+        max_running_requests: Optional[int] = None,
+        skip_topk_layers: Optional[List[bool]] = None,
         start_layer: Optional[int] = None,
     ):
         self.size = size
@@ -1610,6 +1631,7 @@ class HybridLinearKVPool(KVCache):
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
         self.use_mla = use_mla
+        self.use_dsa = use_dsa
         if not use_mla:
             TokenToKVPoolClass = MHATokenToKVPool
 
@@ -1632,6 +1654,31 @@ class HybridLinearKVPool(KVCache):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 enable_kv_cache_copy=enable_kv_cache_copy,
+            )
+        elif use_dsa:
+            # DSA sparse full-attention layers share the MLA latent layout and
+            # additionally keep a paged index_k cache. Only full-attn layer count
+            # is allocated here; the wrapper translates global layer_id to dense.
+            assert (
+                index_head_dim is not None and kv_cache_dim is not None
+            ), "HybridLinearKVPool with use_dsa requires index_head_dim and kv_cache_dim"
+            DSAPoolCls = DSATokenToKVPool
+            self.full_kv_pool = DSAPoolCls(
+                size=size,
+                page_size=self.page_size,
+                kv_lora_rank=kv_lora_rank,
+                dtype=dtype,
+                qk_rope_head_dim=qk_rope_head_dim,
+                layer_num=self.full_layer_nums,
+                device=device,
+                index_head_dim=index_head_dim,
+                enable_memory_saver=enable_memory_saver,
+                kv_cache_dim=kv_cache_dim,
+                index_kpool=index_kpool,
+                index_kpool_compress=index_kpool_compress,
+                tail_extra_slots=tail_extra_slots,
+                max_running_requests=max_running_requests,
+                skip_topk_layers=skip_topk_layers,
             )
         else:
             TokenToKVPoolClass = MLATokenToKVPool
@@ -1663,6 +1710,41 @@ class HybridLinearKVPool(KVCache):
         else:
             k_size, v_size = self.get_kv_size_bytes()
             self.mem_usage = (k_size + v_size) / GB
+
+    @property
+    def dsa_kv_cache_store_fp8(self) -> bool:
+        return getattr(self.full_kv_pool, "dsa_kv_cache_store_fp8", False)
+
+    @property
+    def kv_cache_dim(self):
+        return getattr(self.full_kv_pool, "kv_cache_dim", None)
+
+    @property
+    def index_head_dim(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "index_head_dim", None)
+
+    @property
+    def quant_block_size(self) -> Optional[int]:
+        return getattr(self.full_kv_pool, "quant_block_size", None)
+
+    @property
+    def index_kpool(self) -> int:
+        return getattr(self.full_kv_pool, "index_kpool", 1)
+
+    @property
+    def index_kpool_compress(self) -> bool:
+        return bool(getattr(self.full_kv_pool, "index_kpool_compress", False))
+
+    @property
+    def tail_extra_slots(self) -> int:
+        return getattr(self.full_kv_pool, "tail_extra_slots", 0)
+
+    @property
+    def slots_per_page(self) -> int:
+        return getattr(self.full_kv_pool, "slots_per_page", self.page_size)
+
+    def _is_layer_owned(self, layer_id: int) -> bool:
+        return True
 
     def get_kv_size_bytes(self):
         return self.full_kv_pool.get_kv_size_bytes()
@@ -1763,7 +1845,7 @@ class HybridLinearKVPool(KVCache):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
         mamba_cpu = (
             self.mamba_pool.get_cpu_copy(mamba_indices)
@@ -1772,7 +1854,9 @@ class HybridLinearKVPool(KVCache):
         )
         return kv_cpu, mamba_cpu
 
-    def load_cpu_copy(self, cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         kv_cpu, mamba_cpu = cache_cpu
         self.full_kv_pool.load_cpu_copy(kv_cpu, indices)
         if mamba_cpu is not None and mamba_indices is not None:
@@ -1792,6 +1876,14 @@ class HybridLinearKVPool(KVCache):
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
 
+    def prefetch_full_attention_kv_buffer(self, layer_id: int) -> None:
+        if not self.use_mla or not hasattr(self.full_kv_pool, "prefetch_kv_buffer"):
+            return
+        if layer_id not in self.full_attention_layer_id_mapping:
+            return
+        full_layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.prefetch_kv_buffer(full_layer_id)
+
     def get_mla_kv_buffer(
         self,
         layer: RadixAttention,
@@ -1801,6 +1893,145 @@ class HybridLinearKVPool(KVCache):
         assert self.use_mla, "get_mla_kv_buffer called when use_mla is False"
         with self._transfer_id_context(layer):
             return self.full_kv_pool.get_mla_kv_buffer(layer, loc, dst_dtype)
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        assert self.use_dsa, "set_index_k_scale_buffer called when use_dsa is False"
+        layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.set_index_k_scale_buffer(
+            layer_id, loc, index_k, index_k_scale
+        )
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        assert (
+            self.use_dsa
+        ), "get_index_k_with_scale_buffer called when use_dsa is False"
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id)
+
+    def get_broadcastable_index_k_with_scale_buffer(
+        self, layer_id: int
+    ) -> torch.Tensor:
+        assert (
+            self.use_dsa
+        ), "get_broadcastable_index_k_with_scale_buffer called when use_dsa is False"
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        if hasattr(self.full_kv_pool, "_get_broadcastable_index_buffer"):
+            return self.full_kv_pool._get_broadcastable_index_buffer(layer_id)
+        return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id)
+
+    def invalidate_index_buffer_for_layer(self, layer_id: int) -> None:
+        if not self.use_dsa or not hasattr(
+            self.full_kv_pool, "invalidate_index_buffer_for_layer"
+        ):
+            return
+        layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.invalidate_index_buffer_for_layer(layer_id)
+
+    def get_index_k_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        assert self.use_dsa, "get_index_k_continuous called when use_dsa is False"
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_index_k_continuous(layer_id, seq_len, page_indices)
+
+    def get_index_k_scale_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        assert self.use_dsa, "get_index_k_scale_continuous called when use_dsa is False"
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_index_k_scale_continuous(
+            layer_id, seq_len, page_indices
+        )
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len_tensor: torch.Tensor,
+        page_indices: torch.Tensor,
+        seq_len_sum: int,
+        max_seq_len: int,
+    ):
+        assert self.use_dsa, "get_index_k_scale_buffer called when use_dsa is False"
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_index_k_scale_buffer(
+            layer_id, seq_len_tensor, page_indices, seq_len_sum, max_seq_len
+        )
+
+    def get_compress_tail_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        assert self.use_dsa, "get_compress_tail_buffers called when use_dsa is False"
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_compress_tail_buffers(layer_id)
+
+    def kpool_decode_update_index_cache(
+        self,
+        layer_id: int,
+        key: torch.Tensor,
+        slot_score: torch.Tensor,
+        ape: torch.Tensor,
+        block_tables: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        round_scale: bool = False,
+    ) -> None:
+        assert (
+            self.use_dsa
+        ), "kpool_decode_update_index_cache called when use_dsa is False"
+        layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.kpool_decode_update_index_cache(
+            layer_id=layer_id,
+            key=key,
+            slot_score=slot_score,
+            ape=ape,
+            block_tables=block_tables,
+            req_pool_indices=req_pool_indices,
+            positions=positions,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            round_scale=round_scale,
+        )
+
+    def set_compress_tail_for_request(
+        self,
+        layer_id: int,
+        req_pool_idx: torch.Tensor,
+        key_tail: torch.Tensor,
+        score_tail: torch.Tensor,
+        n_remain: int,
+        dst_logical_start: int,
+    ) -> None:
+        assert (
+            self.use_dsa
+        ), "set_compress_tail_for_request called when use_dsa is False"
+        layer_id = self._transfer_full_attention_id(layer_id)
+        self.full_kv_pool.set_compress_tail_for_request(
+            layer_id=layer_id,
+            req_pool_idx=req_pool_idx,
+            key_tail=key_tail,
+            score_tail=score_tail,
+            n_remain=n_remain,
+            dst_logical_start=dst_logical_start,
+        )
 
 
 class MLATokenToKVPool(KVCache):
@@ -1976,10 +2207,12 @@ class MLATokenToKVPool(KVCache):
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
-                cache_k_rope = cache_k_rope.to(self.dtype)
+                if cache_k_rope is not None and cache_k_rope.numel() > 0:
+                    cache_k_rope = cache_k_rope.to(self.dtype)
             if self.store_dtype != self.dtype:
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
-                cache_k_rope = cache_k_rope.view(self.store_dtype)
+                if cache_k_rope is not None and cache_k_rope.numel() > 0:
+                    cache_k_rope = cache_k_rope.view(self.store_dtype)
 
             set_mla_kv_buffer_triton(
                 self.kv_buffer[layer_id - self.start_layer],
@@ -2003,11 +2236,14 @@ class MLATokenToKVPool(KVCache):
             dtype=dst_dtype,
             device=kv_buffer.device,
         )
-        cache_k_rope = torch.empty(
-            (loc.shape[0], 1, self.qk_rope_head_dim),
-            dtype=dst_dtype,
-            device=kv_buffer.device,
-        )
+        if self.qk_rope_head_dim == 0:
+            cache_k_rope = None
+        else:
+            cache_k_rope = torch.empty(
+                (loc.shape[0], 1, self.qk_rope_head_dim),
+                dtype=dst_dtype,
+                device=kv_buffer.device,
+            )
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
 
@@ -2025,12 +2261,14 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
-    def get_cpu_copy(self, indices, mamba_indices=None):
+    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             kv_cache_cpu.append([])
+            if self.kv_buffer[layer_id].shape[0] == 0:
+                continue
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 kv_cpu = self.kv_buffer[layer_id][chunk_indices].to(
@@ -2040,10 +2278,14 @@ class MLATokenToKVPool(KVCache):
         current_platform.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+    def load_cpu_copy(
+        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
+    ):
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
+            if self.kv_buffer[layer_id].shape[0] == 0:
+                continue
             for i in range(0, len(indices), chunk_size):
                 chunk_indices = indices[i : i + chunk_size]
                 kv_cpu = kv_cache_cpu[layer_id][i // chunk_size]
@@ -2169,7 +2411,8 @@ class MLATokenToKVPoolFP4(MLATokenToKVPool):
 
             if self.store_dtype != self.dtype:
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
-                cache_k_rope = cache_k_rope.view(self.store_dtype)
+                if cache_k_rope is not None and cache_k_rope.numel() > 0:
+                    cache_k_rope = cache_k_rope.view(self.store_dtype)
 
             set_mla_kv_buffer_triton(
                 self.kv_buffer[layer_id - self.start_layer],
@@ -2205,6 +2448,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         index_buf_size: Optional[int] = None,
+        index_kpool: int = 1,
+        index_kpool_compress: bool = False,
+        tail_extra_slots: int = 0,
+        max_running_requests: Optional[int] = None,
+        skip_topk_layers: Optional[List[bool]] = None,
     ):
         override_dim = (
             kv_cache_dim if kv_cache_dim != kv_lora_rank + qk_rope_head_dim else None
@@ -2227,8 +2475,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        self.index_kpool = index_kpool
+        self.index_kpool_compress = index_kpool_compress
+        self.tail_extra_slots = tail_extra_slots
+        self.slots_per_page = self.page_size
         if index_buf_size is None:
             index_buf_size = size
+        self.index_buf_size = index_buf_size
+        self.skip_topk_layers = (
+            list(skip_topk_layers)
+            if skip_topk_layers is not None
+            else [False] * layer_num
+        )
+        assert len(self.skip_topk_layers) == layer_num
         # num head == 1 and head dim == 128 for index_k in DSA
         assert index_head_dim == 128
 
@@ -2268,11 +2527,103 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(layer_num)
             ]
+        self.kpool_use_compress = index_kpool > 1 and index_kpool_compress
+        if self.kpool_use_compress:
+            assert (
+                max_running_requests is not None
+            ), "DSATokenToKVPool with kpool compression requires max_running_requests"
+            req_pool_size = max_running_requests + 1
+            tail_width = index_kpool + tail_extra_slots
+            self._compress_tail_k = [
+                torch.zeros(
+                    req_pool_size if not self.skip_topk_layers[i] else 0,
+                    tail_width,
+                    index_head_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                for i in range(layer_num)
+            ]
+            self._compress_tail_score = [
+                torch.zeros_like(x) for x in self._compress_tail_k
+            ]
+        else:
+            self._compress_tail_k = None
+            self._compress_tail_score = None
         self._finalize_allocation_log(size)
+
+    def get_compress_tail_buffers(self, layer_id: int):
+        assert self.kpool_use_compress
+        idx = layer_id - self.start_layer
+        return self._compress_tail_k[idx], self._compress_tail_score[idx]
+
+    def kpool_decode_update_index_cache(
+        self,
+        layer_id,
+        key,
+        slot_score,
+        ape,
+        block_tables,
+        req_pool_indices,
+        positions,
+        seq_lens,
+        out_cache_loc,
+        round_scale=False,
+    ):
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            kpool_decode_update_and_maybe_write_cache,
+        )
+
+        idx = layer_id - self.start_layer
+        kpool_decode_update_and_maybe_write_cache(
+            pool=self,
+            buf=self.get_index_k_with_scale_buffer(layer_id),
+            tail_k=self._compress_tail_k[idx],
+            tail_score=self._compress_tail_score[idx],
+            key=key,
+            slot_score=slot_score,
+            ape=ape,
+            block_tables=block_tables,
+            req_pool_indices=req_pool_indices,
+            positions=positions,
+            seq_lens=seq_lens,
+            out_cache_loc=out_cache_loc,
+            round_scale=round_scale,
+        )
+
+    def set_compress_tail_for_request(
+        self,
+        layer_id,
+        req_pool_idx,
+        key_tail,
+        score_tail,
+        n_remain,
+        dst_logical_start,
+    ):
+        idx = layer_id - self.start_layer
+        if n_remain > 0:
+            slots = (
+                torch.arange(n_remain, device=key_tail.device, dtype=torch.long)
+                + int(dst_logical_start)
+            ) % self._compress_tail_k[idx].shape[1]
+            self._compress_tail_k[idx][req_pool_idx, slots] = key_tail
+            self._compress_tail_score[idx][req_pool_idx, slots] = score_tail
+
+    def _get_broadcastable_index_buffer(self, layer_id: int):
+        return self.get_index_k_with_scale_buffer(layer_id)
+
+    def invalidate_index_buffer_for_layer(self, layer_id: int):
+        return None
+
+    def _is_layer_owned(self, layer_id: int) -> bool:
+        return True
 
     def _clear_buffers(self):
         del self.kv_buffer
         del self.index_k_with_scale_buffer
+        if self._compress_tail_k is not None:
+            del self._compress_tail_k
+            del self._compress_tail_score
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""

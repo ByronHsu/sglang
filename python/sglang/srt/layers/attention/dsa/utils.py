@@ -8,6 +8,8 @@ import triton.language as tl
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    attn_cp_all_gather_into_tensor,
+    attn_cp_reduce_scatter_tensor,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
@@ -60,8 +62,15 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int):
-    return original_seq_lens.clamp(max=dsa_index_topk)
+def compute_dsa_seqlens(original_seq_lens, dsa_index_topk: int, index_kpool: int = 1):
+    if index_kpool <= 1:
+        return original_seq_lens.clamp(max=dsa_index_topk)
+
+    full_pool_tokens = (
+        torch.div(original_seq_lens, index_kpool, rounding_mode="floor") * index_kpool
+    )
+    selected_history_tokens = full_pool_tokens.clamp(max=dsa_index_topk)
+    return selected_history_tokens + original_seq_lens - full_pool_tokens
 
 
 def is_dsa_enable_prefill_cp():
@@ -93,6 +102,45 @@ def can_dsa_prefill_cp_round_robin_split(forward_batch: "ForwardBatch"):
         and seq_len >= cp_size
         and cp_size > 1
     )
+
+
+def cp_zigzag_full_plan_rows(
+    forward_batch: "ForwardBatch", device: torch.device
+) -> torch.Tensor | None:
+    cp_meta = getattr(forward_batch, "attn_cp_metadata", None)
+    if cp_meta is None or getattr(cp_meta, "zigzag_index", None) is None:
+        return None
+    if (
+        getattr(forward_batch, "extend_seq_lens_cpu", None) is None
+        or getattr(cp_meta, "split_list", None) is None
+    ):
+        return None
+
+    extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+    bs = len(extend_lens)
+    split_list = [int(x) for x in cp_meta.split_list]
+    if bs == 0 or len(split_list) % bs != 0:
+        return None
+    cp_segment_num = len(split_list) // bs
+
+    q_offsets = [0]
+    for q_len in extend_lens:
+        q_offsets.append(q_offsets[-1] + q_len)
+
+    rows: List[int] = []
+    for seg_idx in cp_meta.zigzag_index:
+        seg_idx = int(seg_idx)
+        batch_id = seg_idx // cp_segment_num
+        block_id = seg_idx % cp_segment_num
+        if batch_id >= bs:
+            return None
+        block_base = batch_id * cp_segment_num
+        block_start = sum(split_list[block_base : block_base + block_id])
+        block_len = split_list[seg_idx]
+        row_start = q_offsets[batch_id] + block_start
+        rows.extend(range(row_start, row_start + block_len))
+
+    return torch.tensor(rows, dtype=torch.long, device=device)
 
 
 def dsa_cp_round_robin_split_data(input_: Union[torch.Tensor, List]):
@@ -194,6 +242,50 @@ def can_dsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
         return True
     else:
         return False
+
+
+def cp_plain_split(input_tensor: torch.Tensor) -> torch.Tensor:
+    cp_size = get_attention_cp_size()
+    cp_rank = get_attention_cp_rank()
+    assert input_tensor.shape[0] % cp_size == 0
+    chunk = input_tensor.shape[0] // cp_size
+    return input_tensor[cp_rank * chunk : (cp_rank + 1) * chunk].contiguous()
+
+
+def cp_plain_all_gather(input_tensor: torch.Tensor, cp_size: int) -> torch.Tensor:
+    output = input_tensor.new_empty(
+        (input_tensor.shape[0] * cp_size, *input_tensor.shape[1:])
+    )
+    attn_cp_all_gather_into_tensor(output, input_tensor)
+    return output
+
+
+def cp_plain_reduce_scatter(input_tensor: torch.Tensor, cp_size: int) -> torch.Tensor:
+    assert input_tensor.shape[0] % cp_size == 0
+    output = input_tensor.new_empty(
+        (input_tensor.shape[0] // cp_size, *input_tensor.shape[1:])
+    )
+    attn_cp_reduce_scatter_tensor(output, input_tensor.contiguous())
+    return output
+
+
+def cp_plain_to_scattered(input_tensor, forward_batch, cp_size: int):
+    from sglang.srt.layers.utils.cp_utils import cp_split_and_rebuild_data
+
+    return cp_split_and_rebuild_data(
+        forward_batch, cp_plain_all_gather(input_tensor, cp_size)
+    )
+
+
+def cp_scattered_to_plain(input_tensor, forward_batch, cp_size: int):
+    from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+
+    full = cp_all_gather_rerange_output(
+        input_tensor, cp_size, forward_batch, torch.cuda.current_stream()
+    )
+    chunk = full.shape[0] // cp_size
+    cp_rank = get_attention_cp_rank()
+    return full[cp_rank * chunk : (cp_rank + 1) * chunk].contiguous()
 
 
 @triton.jit

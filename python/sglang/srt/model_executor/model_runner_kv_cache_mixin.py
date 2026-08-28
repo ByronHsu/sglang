@@ -6,7 +6,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
+    get_dsa_index_kpool,
+    get_dsa_index_kpool_compress,
     is_deepseek_dsa,
     is_deepseek_v4,
 )
@@ -560,6 +563,24 @@ class ModelRunnerKVCacheMixin:
                 pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
                     self.server_args
                 ).host_to_device_ratio
+            index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
+            if self.enable_hisparse and index_kpool > 1:
+                raise ValueError("KPool is not supported with HiSparse")
+            if not self.enable_hisparse:
+                pool_kwargs.update(
+                    index_kpool=index_kpool,
+                    index_kpool_compress=get_dsa_index_kpool_compress(
+                        self.model_config.hf_config
+                    ),
+                    tail_extra_slots=(
+                        self.server_args.max_speculative_num_draft_tokens or 0
+                    ),
+                    max_running_requests=self.req_to_token_pool.req_to_token.shape[0],
+                    skip_topk_layers=[
+                        dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                        for layer_id in range(self.start_layer, self.end_layer)
+                    ],
+                )
             self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -642,6 +663,45 @@ class ModelRunnerKVCacheMixin:
                         "kv_lora_rank": self.model_config.kv_lora_rank,
                         "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
                     }
+                    if is_dsa_model:
+                        full_layer_ids = (
+                            [0]
+                            if self.is_draft_worker
+                            else [
+                                i
+                                for i in config.full_attention_layer_ids
+                                if self.start_layer <= i < self.end_layer
+                            ]
+                        )
+                        extra_args.update(
+                            use_dsa=True,
+                            index_head_dim=get_dsa_index_head_dim(
+                                self.model_config.hf_config
+                            ),
+                            kv_cache_dim=self.calculate_mla_kv_cache_dim(),
+                            index_kpool=get_dsa_index_kpool(
+                                self.model_config.hf_config
+                            ),
+                            index_kpool_compress=get_dsa_index_kpool_compress(
+                                self.model_config.hf_config
+                            ),
+                            tail_extra_slots=(
+                                self.server_args.max_speculative_num_draft_tokens or 0
+                            ),
+                            max_running_requests=(
+                                self.req_to_token_pool.req_to_token.shape[0]
+                            ),
+                            skip_topk_layers=(
+                                None
+                                if self.is_draft_worker
+                                else [
+                                    dsa_layer_skips_topk(
+                                        self.model_config.hf_config, layer_id
+                                    )
+                                    for layer_id in full_layer_ids
+                                ]
+                            ),
+                        )
                 self.token_to_kv_pool = HybridLinearKVPool(
                     page_size=self.page_size,
                     size=self.max_total_num_tokens,

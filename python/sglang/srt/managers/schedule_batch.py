@@ -763,6 +763,7 @@ class Req(ReqDllmMixin):
         self.mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
         self.mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
         self.mamba_next_track_idx: Optional[int] = None  # 0 or 1
+        self.mamba_last_track_idx: Optional[int] = None  # 0 or 1
         self.mamba_last_track_seqlen: Optional[int] = (
             None  # seq len of the last cached mamba state
         )
@@ -1367,6 +1368,7 @@ class Req(ReqDllmMixin):
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
+        self.mamba_last_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.mamba_cow_src_index = None
@@ -1496,9 +1498,11 @@ def set_mamba_track_indices_from_reqs(batch):
     all_buffers = req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[
         batch.req_pool_indices
     ]  # (bs, ping_pong_size), int64, on device
+    track_positions = [req.mamba_next_track_idx for req in batch.reqs]
+    batch.mamba_track_buffer_indices = list(track_positions)
     idx = (
         torch.tensor(
-            [req.mamba_next_track_idx for req in batch.reqs],
+            track_positions,
             dtype=torch.int64,
             pin_memory=True,
         )
@@ -1654,8 +1658,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # For hybrid GDN prefix cache
     mamba_track_indices: torch.Tensor = None  # shape: [b], int64
+    mamba_track_buffer_indices: Optional[List[int]] = None  # shape: [b], 0 or 1
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    mamba_track_mask_cpu: Optional[List[bool]] = None  # shape: [b]
+    mamba_track_mask_next_cpu: Optional[List[bool]] = None  # shape: [b]
+    mamba_decode_batch_idx_cpu: Optional[List[int]] = None  # shape: [b]
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
@@ -2218,6 +2226,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # In lazy mode, skip the swap — the second ping-pong slot is not
             # allocated yet; it will be allocated on demand at the track boundary
             # in mamba_lazy_prealloc_at_boundary during prepare_for_decode.
+            req.mamba_last_track_idx = req.mamba_next_track_idx
             if not get_global_server_args().enable_mamba_extra_buffer_lazy():
                 req.mamba_next_track_idx = (
                     self.req_to_token_pool.get_mamba_ping_pong_other_idx(
@@ -2591,16 +2600,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
+                self.mamba_track_buffer_indices = []
             else:
                 if get_global_server_args().enable_mamba_extra_buffer_lazy():
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 
+            track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
+            track_mask_cpu = track_remainders_cpu == 0
+            self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+            self.mamba_track_mask_next_cpu = (
+                (track_remainders_cpu == mamba_track_interval - 1).tolist()
+                if self.enable_overlap
+                else None
+            )
+            self.mamba_decode_batch_idx_cpu = [
+                req.decode_batch_idx for req in self.reqs
+            ]
             # async H2D
-            self.mamba_track_mask = (
-                (self.seq_lens_cpu % mamba_track_interval == 0)
-                .pin_memory()
-                .to(device=self.device, non_blocking=True)
+            self.mamba_track_mask = track_mask_cpu.pin_memory().to(
+                device=self.device, non_blocking=True
             )
 
     def filter_batch(
@@ -2659,8 +2678,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu = self.seq_lens_cpu[keep_indices]
 
         self.mamba_track_indices = None
+        self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_mask_cpu = None
+        self.mamba_track_mask_next_cpu = None
+        self.mamba_decode_batch_idx_cpu = None
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
@@ -2721,8 +2744,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         else:
             self.seq_lens_cpu = torch.cat([self.seq_lens_cpu, other.seq_lens_cpu])
         self.mamba_track_indices = None
+        self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_mask_cpu = None
+        self.mamba_track_mask_next_cpu = None
+        self.mamba_decode_batch_idx_cpu = None
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
@@ -2768,8 +2795,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             seq_lens_cpu=self.seq_lens_cpu,
             enable_overlap=self.enable_overlap,
             mamba_track_indices=self.mamba_track_indices,
+            mamba_track_buffer_indices=self.mamba_track_buffer_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_mask_cpu=self.mamba_track_mask_cpu,
+            mamba_track_mask_next_cpu=self.mamba_track_mask_next_cpu,
+            mamba_decode_batch_idx_cpu=self.mamba_decode_batch_idx_cpu,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
             fpm_start_time=self.fpm_start_time,

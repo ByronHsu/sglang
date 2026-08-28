@@ -153,15 +153,7 @@ def build_kv_cache(
 
     # Hybrid memory pool
     is_hybrid_swa = tp_worker.is_hybrid_swa
-    _spec = tp_worker.model_runner.linear_attn_model_spec
-    _registry_needs_mamba = _spec.uses_mamba_radix_cache if _spec is not None else False
-    is_hybrid_ssm = (
-        tp_worker.model_runner.hybrid_gdn_config is not None
-        or tp_worker.model_runner.mamba2_config is not None
-        or _registry_needs_mamba
-        or tp_worker.model_runner.kimi_linear_config is not None
-        or tp_worker.model_runner.hybrid_lightning_config is not None
-    )
+    is_hybrid_ssm = tp_worker.model_runner.mambaish_config is not None
 
     sliding_window_size = None
     if is_hybrid_swa:

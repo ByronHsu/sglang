@@ -131,9 +131,41 @@ def get_dsa_index_topk(config: PretrainedConfig) -> int:
     return config.index_topk
 
 
+def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
+    """Return whether a DSA layer reuses the preceding layer's top-k indices."""
+    assert is_deepseek_dsa(config)
+
+    pattern = getattr(config, "index_topk_pattern", None)
+    if pattern is not None:
+        return layer_id < len(pattern) and pattern[layer_id] == "S"
+
+    freq = getattr(config, "index_topk_freq", 1) or 1
+    assert freq > 0, f"index_topk_freq must be positive, got {freq}"
+    offset = getattr(config, "index_skip_topk_offset", None)
+    if offset is not None:
+        assert offset > 0, "index_skip_topk_offset must be positive"
+        return max(layer_id - offset + 1, 0) % freq != 0
+
+    return max(layer_id - 1, 0) % freq != 0
+
+
 def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads
+
+
+def get_dsa_index_kpool(config: PretrainedConfig) -> int:
+    index_kpool = getattr(config, "index_kpool", 1)
+    assert index_kpool >= 1, f"index_kpool must be positive, got {index_kpool}"
+    return index_kpool
+
+
+def get_dsa_mtp_topk_width(config: PretrainedConfig) -> int:
+    return get_dsa_index_topk(config) + get_dsa_index_kpool(config) - 1
+
+
+def get_dsa_index_kpool_compress(config: PretrainedConfig) -> bool:
+    return getattr(config, "index_kpool_compress", False)
 
 
 def get_num_indexer_layers(config) -> int:
