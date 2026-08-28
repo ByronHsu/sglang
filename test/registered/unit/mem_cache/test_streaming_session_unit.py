@@ -70,6 +70,7 @@ class _FakeReq:
         self.mamba_pool_idx = None
         self.mamba_ping_pong_track_buffer = None
         self.mamba_next_track_idx = None
+        self.mamba_last_track_idx = None
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.pop_overallocated_calls = 0

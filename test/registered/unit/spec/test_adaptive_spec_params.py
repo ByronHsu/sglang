@@ -1,7 +1,9 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 
+from sglang.srt.speculative.adaptive_runtime_state import AdaptiveController
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
@@ -225,9 +227,11 @@ class TestAdaptiveSpeculativeParams(unittest.TestCase):
     def test_default_config_loads(self):
         params = AdaptiveSpeculativeParams(initial_steps=3)
         self.assertEqual(params._bs_list, [1, 8, 32])
-        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 7])
+        self.assertEqual(params._slots[1].candidate_steps, [1, 3, 5, 7])
         self.assertEqual(params._slots[8].candidate_steps, [1, 3])
         self.assertEqual(params._slots[32].candidate_steps, [1])
+
+        validate_adaptive_initial_steps(5)
 
     def test_config_file(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
@@ -326,14 +330,14 @@ class TestBatchSizeRouting(unittest.TestCase):
     """BS-aware routing: batch size selects the slot, CUDA-graph BS pads first."""
 
     def _params(self):
-        # Slots: bs=1 -> [1,3,7], bs=8 -> [1,3], bs=32 -> [1].
+        # Slots: bs=1 -> [1,3,5,7], bs=8 -> [1,3], bs=32 -> [1].
         return AdaptiveSpeculativeParams(initial_steps=3)
 
     def test_routes_to_floor_slot_without_cuda_graph(self):
         params = self._params()
         # A batch maps to the largest slot BS <= batch (floor), capped at the top slot.
-        self.assertEqual(params._route(1).candidate_steps, [1, 3, 7])
-        self.assertEqual(params._route(7).candidate_steps, [1, 3, 7])
+        self.assertEqual(params._route(1).candidate_steps, [1, 3, 5, 7])
+        self.assertEqual(params._route(7).candidate_steps, [1, 3, 5, 7])
         self.assertEqual(params._route(8).candidate_steps, [1, 3])
         self.assertEqual(params._route(31).candidate_steps, [1, 3])
         self.assertEqual(params._route(32).candidate_steps, [1])
@@ -380,6 +384,7 @@ class TestResolveCandidateSteps(unittest.TestCase):
         steps = resolve_candidate_steps_from_config()
         self.assertIn(1, steps)
         self.assertIn(3, steps)
+        self.assertIn(5, steps)
         self.assertIn(7, steps)
 
     def test_config_file(self):
@@ -421,6 +426,43 @@ class TestValidateAdaptiveInitialSteps(unittest.TestCase):
             # 9 is in no slot -> rejected.
             with self.assertRaises(ValueError):
                 validate_adaptive_initial_steps(9, cfg_path=f.name)
+
+
+class TestAdaptiveController(unittest.TestCase):
+    def test_defers_state_swap_until_next_batch(self):
+        class Worker:
+            speculative_num_steps = 3
+
+            def __init__(self):
+                self.applied = []
+
+            def apply_runtime_state(self, state):
+                self.speculative_num_steps = state.speculative_num_steps
+                self.applied.append(state.speculative_num_steps)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {
+                        "candidate_steps": [1, 3],
+                        "ema_alpha": 1.0,
+                        "warmup_batches": 0,
+                        "update_interval": 1,
+                    }
+                },
+                f,
+            )
+            f.flush()
+            worker = Worker()
+            controller = AdaptiveController(worker, config_path=f.name)
+            for steps in (1, 3):
+                controller.register(SimpleNamespace(speculative_num_steps=steps))
+
+            controller.on_verify_complete([0], batch_size=1)
+            self.assertEqual(worker.applied, [])
+
+            controller.activate_step_by_batch(batch_size=1)
+            self.assertEqual(worker.applied, [1])
 
 
 if __name__ == "__main__":

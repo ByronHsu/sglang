@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "hardware": {
+    "host": "bj-3298075",
+    "gpu_count": 8,
+    "gpu_model": "NVIDIA H200",
+    "gpu_memory_mib": 143771
+  },
+  "provenance": {
+    "upstream_sha": "aa8c950a3df62b6642c4ea60a93a5e3eb1a1450e",
+    "backport_base_sha": "25c6b03048",
+    "backport_range": "25c6b03048..HEAD",
+    "model": "zai-org/GLM-5.3-Flash",
+    "model_revision": "c5b82b63e37b10546e7ac2eae571fd8d099ae898"
+  },
+  "environment_capture": [
+    "git rev-parse HEAD",
+    "python -m pip freeze",
+    "nvidia-smi -q",
+    "python -m sglang.version"
+  ],
+  "backport_validated_dependencies": {
+    "python": "3.12",
+    "torch": "2.11.0+cu130",
+    "triton": "3.6.0",
+    "transformers": "5.8.1",
+    "sglang_kernel": "0.4.3+cu130",
+    "flashinfer_python": "0.6.12",
+    "deep_gemm": "0.1.5+source.fa3a5ca07d768dd0f9089f70a445208b166c48d1",
+    "tilelang": "0.1.12",
+    "apache_tvm_ffi": "0.1.11"
+  },
+  "upstream_validated_dependencies": {
+    "python": "3.12",
+    "torch": "2.13.0+cu130",
+    "triton": "3.7.1",
+    "transformers": "5.12.1",
+    "sglang_kernel": "0.4.6.post1+cu130",
+    "flashinfer_python": "0.6.17",
+    "deep_gemm": "0.1.5.post3",
+    "tilelang": "0.1.12",
+    "apache_tvm_ffi": "0.1.11"
+  },
+  "server": {
+    "environment": {
+      "SGLANG_ENABLE_SPEC_V2": "1",
+      "CUDA_HOME": "/usr/local/cuda"
+    },
+    "common_args": [
+      "--tp-size", "8",
+      "--ep-size", "8",
+      "--dsa-prefill-backend", "tilelang",
+      "--dsa-decode-backend", "tilelang",
+      "--linear-attn-backend", "triton",
+      "--kv-cache-dtype", "bfloat16",
+      "--quantization", "fp8",
+      "--moe-runner-backend", "deep_gemm",
+      "--disable-shared-experts-fusion",
+      "--mem-fraction-static", "0.75",
+      "--max-total-tokens", "196608",
+      "--max-running-requests", "128",
+      "--max-mamba-cache-size", "960",
+      "--random-seed", "20260827"
+    ],
+    "mtp_args": [
+      "--mamba-scheduler-strategy", "extra_buffer",
+      "--speculative-algorithm", "NEXTN",
+      "--speculative-num-steps", "5",
+      "--speculative-eagle-topk", "1",
+      "--speculative-num-draft-tokens", "6",
+      "--speculative-adaptive"
+    ]
+  },
+  "accuracy": {
+    "dataset": "GSM8K",
+    "num_questions": 1319,
+    "num_shots": 5,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "max_new_tokens": 32768,
+    "thinking": true,
+    "reasoning_effort": "max",
+    "seed": 20260827,
+    "variants": ["upstream-no-mtp", "upstream-mtp", "backport-no-mtp", "backport-mtp"]
+  },
+  "performance": {
+    "warmups_discarded": 2,
+    "measured_runs": 3,
+    "seed": 20260827,
+    "cache_flush": "POST /flush_cache before every run",
+    "rows": [
+      {"profile": "low-latency-mtp", "input_tokens": 1024, "output_tokens": 256, "concurrency": 1, "num_prompts": 5},
+      {"profile": "low-latency-mtp", "input_tokens": 1024, "output_tokens": 256, "concurrency": 16, "num_prompts": 80},
+      {"profile": "high-throughput", "input_tokens": 1024, "output_tokens": 256, "concurrency": 16, "num_prompts": 80},
+      {"profile": "high-throughput", "input_tokens": 1024, "output_tokens": 256, "concurrency": 64, "num_prompts": 320},
+      {"profile": "high-throughput", "input_tokens": 1024, "output_tokens": 256, "concurrency": 256, "num_prompts": 1280},
+      {"profile": "hybrid-long-context", "input_tokens": 32768, "output_tokens": 1024, "concurrency": 1, "num_prompts": 5},
+      {"profile": "hybrid-long-context", "input_tokens": 32768, "output_tokens": 1024, "concurrency": 8, "num_prompts": 40}
+    ]
+  },
+  "gates": {
+    "accuracy_min_pct": 97.0,
+    "accuracy_gap_max_points": 0.5,
+    "stop_rate_min_pct": 99.5,
+    "mtp_acceptance_retention_min_ratio": 0.95,
+    "mtp_acceptance_length_min": 2.7,
+    "throughput_retention_min_ratio": 0.9,
+    "ttft_regression_max_ratio": 1.1,
+    "tpot_regression_max_ratio": 1.1,
+    "peak_memory_regression_max_ratio": 1.1,
+    "request_failures_max": 0,
+    "worker_restarts_max": 0,
+    "nan_count_max": 0,
+    "cuda_graph_errors_max": 0
+  },
+  "raw_results": {
+    "directory": "raw",
+    "status": "partial"
+  },
+  "validated_results": {
+    "official_accuracy": {
+      "upstream_no_mtp": {
+        "correct": 1282,
+        "accuracy": 0.971948,
+        "stop_rate": 0.998484,
+        "raw_path": "/root/benchmark-logs/glm53/official/upstream-no-mtp"
+      },
+      "backport_no_mtp": {
+        "correct": 1283,
+        "accuracy": 0.972707,
+        "stop_rate": 1.0,
+        "raw_path": "/root/benchmark-logs/glm53/fused/backport-no-mtp"
+      },
+      "upstream_mtp": {
+        "correct": 1281,
+        "accuracy": 0.971190,
+        "stop_rate": 1.0,
+        "raw_path": "/root/benchmark-logs/glm53/recheck-upstream-mtp"
+      },
+      "backport_mtp": {
+        "correct": 1284,
+        "accuracy": 0.973465,
+        "stop_rate": 0.998484,
+        "raw_path": "/root/benchmark-logs/glm53/recheck-standard-mtp"
+      },
+      "max_gap_points": 0.2274,
+      "gate_passed": true
+    },
+    "unit": {
+      "h200_focused_passed": 182,
+      "h200_subtests_passed": 31
+    },
+    "mtp_performance": {
+      "scope": "Two discarded warmups followed by three measured runs; values are measured-run medians.",
+      "concurrency_1": {
+        "backport": {"output_throughput": 380.908, "mean_ttft_ms": 152.228, "mean_tpot_ms": 2.029, "accept_length": 8.0},
+        "upstream": {"output_throughput": 398.836, "mean_ttft_ms": 164.229, "mean_tpot_ms": 1.861, "accept_length": 7.8375},
+        "ratios": {"throughput_retention": 0.9550, "ttft_regression": 0.9269, "tpot_regression": 1.0906, "acceptance_retention": 1.0207},
+        "gate_passed": true
+      },
+      "concurrency_16": {
+        "backport": {"output_throughput": 1835.178, "mean_ttft_ms": 502.245, "mean_tpot_ms": 6.640, "accept_length": 3.9323},
+        "upstream": {"output_throughput": 2086.553, "mean_ttft_ms": 469.440, "mean_tpot_ms": 5.706, "accept_length": 3.9593},
+        "ratios": {"throughput_retention": 0.8795, "ttft_regression": 1.0699, "tpot_regression": 1.1636, "acceptance_retention": 0.9932},
+        "gate_passed": false
+      },
+      "raw_paths": {
+        "backport": "/root/benchmark-logs/glm53/recheck-standard-mtp",
+        "upstream": "/root/benchmark-logs/glm53/recheck-upstream-mtp"
+      }
+    },
+    "stability": {
+      "request_failures": 0,
+      "worker_restarts": 0,
+      "nan_count": 0,
+      "cuda_graph_errors": 0
+    }
+  },
+  "known_limit": {
+    "validated_context_tokens": 32768,
+    "cold_prefill_cuda_graph_claim_limit": 262144,
+    "upstream_issue": "https://github.com/sgl-project/sglang/issues/36550",
+    "workaround": "Disable prefill CUDA graphs for larger cold-prefill inputs."
+  }
+}

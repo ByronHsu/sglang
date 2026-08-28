@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
 )
 from sglang.srt.layers.attention.fla.index import prepare_chunk_indices
 from sglang.srt.layers.attention.fla.kda import (
+    chunk_kda,
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
@@ -245,6 +246,187 @@ class TestKDAGateChunkCumsum(unittest.TestCase):
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
+class TestKDAChunkExponentDomain(unittest.TestCase):
+    """Guard chunk prefill against mixing natural-log gates with exp2 kernels."""
+
+    @staticmethod
+    def _reference(q, k, v, g, beta, initial_state, lengths):
+        q, k, v, g, beta = (tensor.float() for tensor in (q, k, v, g, beta))
+        output = torch.empty_like(v)
+        final_state = initial_state.float().clone()
+        offset = 0
+        for sequence_index, length in enumerate(lengths):
+            state = final_state[sequence_index]
+            for token_index in range(offset, offset + length):
+                state = state * g[0, token_index].exp().unsqueeze(-2)
+                residual = v[0, token_index] - torch.einsum(
+                    "hvk,hk->hv", state, k[0, token_index]
+                )
+                state += torch.einsum(
+                    "hv,hk->hvk",
+                    residual * beta[0, token_index, :, None],
+                    k[0, token_index],
+                )
+                output[0, token_index] = torch.einsum(
+                    "hvk,hk->hv", state, q[0, token_index]
+                ) * (q.shape[-1] ** -0.5)
+            final_state[sequence_index] = state
+            offset += length
+        return output, final_state
+
+    @staticmethod
+    def _relative_rmse(actual, expected):
+        error = (actual.float() - expected.float()).square().mean().sqrt()
+        baseline = expected.float().square().mean().sqrt().clamp_min(1e-8)
+        return (error / baseline).item()
+
+    @torch.inference_mode()
+    def test_chunk_prefill_matches_natural_exp_recurrence(self):
+        device = get_device()
+        dtype = torch.bfloat16
+        num_heads, head_dim = 2, 64
+        for lengths, fuse_gate in (([129], False), ([2] * 129, True)):
+            with self.subTest(lengths=len(lengths), fuse_gate=fuse_gate):
+                torch.manual_seed(42)
+                total_tokens = sum(lengths)
+                shape = (1, total_tokens, num_heads, head_dim)
+                q = torch.nn.functional.normalize(
+                    torch.randn(shape, device=device), dim=-1
+                ).to(dtype)
+                k = torch.nn.functional.normalize(
+                    torch.randn(shape, device=device), dim=-1
+                ).to(dtype)
+                v = (torch.randn(shape, device=device) * 0.1).to(dtype)
+                raw_gate = (torch.randn(shape, device=device) * 0.5 - 2.0).to(dtype)
+                A_log = torch.randn(num_heads, device=device) * 0.1
+                dt_bias = torch.randn(num_heads * head_dim, device=device) * 0.1
+                activated_gate = -torch.exp(
+                    A_log.view(1, 1, num_heads, 1)
+                ) * torch.nn.functional.softplus(
+                    raw_gate.float() + dt_bias.view(1, 1, num_heads, head_dim)
+                )
+                kernel_gate = raw_gate if fuse_gate else activated_gate.to(dtype)
+                beta = torch.rand(
+                    1, total_tokens, num_heads, dtype=dtype, device=device
+                ).sigmoid()
+                initial_state = (
+                    torch.randn(
+                        len(lengths),
+                        num_heads,
+                        head_dim,
+                        head_dim,
+                        device=device,
+                    )
+                    * 0.05
+                )
+                expected_output, expected_state = self._reference(
+                    q, k, v, activated_gate, beta, initial_state, lengths
+                )
+                actual_state = initial_state.clone()
+                cu_seqlens = torch.tensor(
+                    [0, *torch.tensor(lengths).cumsum(0).tolist()],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                actual_output = chunk_kda(
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=kernel_gate,
+                    beta=beta,
+                    initial_state=actual_state,
+                    initial_state_indices=torch.arange(
+                        len(lengths), dtype=torch.int32, device=device
+                    ),
+                    cu_seqlens=cu_seqlens,
+                    A_log=A_log if fuse_gate else None,
+                    dt_bias=dt_bias if fuse_gate else None,
+                )
+                self.assertLess(
+                    self._relative_rmse(actual_output, expected_output), 1e-2
+                )
+                self.assertLess(self._relative_rmse(actual_state, expected_state), 1e-2)
+
+    @torch.inference_mode()
+    def test_varlen_intermediate_states_match_chunk_boundaries(self):
+        device = get_device()
+        dtype = torch.bfloat16
+        lengths = [65, 129, 17]
+        num_heads, head_dim = 2, 64
+        total_tokens = sum(lengths)
+        shape = (1, total_tokens, num_heads, head_dim)
+
+        torch.manual_seed(43)
+        q = torch.nn.functional.normalize(torch.randn(shape, device=device), dim=-1).to(
+            dtype
+        )
+        k = torch.nn.functional.normalize(torch.randn(shape, device=device), dim=-1).to(
+            dtype
+        )
+        v = (torch.randn(shape, device=device) * 0.1).to(dtype)
+        gate = (torch.randn(shape, device=device) * 0.05 - 0.2).to(dtype)
+        beta = torch.rand(
+            1, total_tokens, num_heads, dtype=dtype, device=device
+        ).sigmoid()
+        initial_state = (
+            torch.randn(
+                len(lengths),
+                num_heads,
+                head_dim,
+                head_dim,
+                device=device,
+            )
+            * 0.05
+        )
+
+        expected_checkpoints = []
+        offset = 0
+        for sequence_index, length in enumerate(lengths):
+            state = initial_state[sequence_index].float().clone()
+            for local_index in range(length):
+                if local_index % 64 == 0:
+                    expected_checkpoints.append(state.clone())
+                token_index = offset + local_index
+                state *= gate[0, token_index].float().exp().unsqueeze(-2)
+                residual = v[0, token_index].float() - torch.einsum(
+                    "hvk,hk->hv", state, k[0, token_index].float()
+                )
+                state += torch.einsum(
+                    "hv,hk->hvk",
+                    residual * beta[0, token_index].float()[:, None],
+                    k[0, token_index].float(),
+                )
+            offset += length
+
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(lengths).cumsum(0).tolist()],
+            dtype=torch.int32,
+            device=device,
+        )
+        actual_state = initial_state.clone()
+        _, checkpoints = chunk_kda(
+            q=q,
+            k=k,
+            v=v.clone(),
+            g=gate,
+            beta=beta,
+            initial_state=actual_state,
+            initial_state_indices=torch.arange(
+                len(lengths), dtype=torch.int32, device=device
+            ),
+            cu_seqlens=cu_seqlens,
+            output_intermediate_states=True,
+        )
+
+        self.assertLess(
+            self._relative_rmse(
+                checkpoints.squeeze(0), torch.stack(expected_checkpoints)
+            ),
+            1e-2,
+        )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKDAPackedDecode(unittest.TestCase):
     """Verify ``fused_recurrent_kda_packed_decode`` matches the existing decode
     path (split + unflatten + ``fused_sigmoid_gating_delta_rule_update``)."""
@@ -270,7 +452,18 @@ class TestKDAPackedDecode(unittest.TestCase):
 
     @staticmethod
     def _run_baseline(
-        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices, H, HV, K, V
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        ssm_states,
+        cache_indices,
+        H,
+        HV,
+        K,
+        V,
+        lower_bound=None,
     ):
         B = mixed_qkv.shape[0]
         q_flat, k_flat, v_flat = torch.split(mixed_qkv, [H * K, H * K, HV * V], dim=-1)
@@ -297,11 +490,22 @@ class TestKDAPackedDecode(unittest.TestCase):
             scale=K**-0.5,
             use_qk_l2norm_in_kernel=True,
             is_kda=True,
+            lower_bound=lower_bound,
         )
 
     @staticmethod
     def _run_packed(
-        mixed_qkv, a, b, A_log, dt_bias, ssm_states, cache_indices, HV, K, V
+        mixed_qkv,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        ssm_states,
+        cache_indices,
+        HV,
+        K,
+        V,
+        lower_bound=None,
     ):
         B = mixed_qkv.shape[0]
         out = mixed_qkv.new_empty(B, 1, HV, V)
@@ -316,8 +520,24 @@ class TestKDAPackedDecode(unittest.TestCase):
             out=out,
             ssm_state_indices=cache_indices,
             use_qk_l2norm_in_kernel=True,
+            lower_bound=lower_bound,
         )
         return out.transpose(0, 1)
+
+    def test_safe_gate_matches_generic_decode(self):
+        H = HV = 2
+        K = V = 64
+        inputs = self._make_inputs(8, H, HV, K, V, 16, torch.bfloat16, get_device())
+        baseline_state = inputs[5].clone()
+        packed_state = inputs[5].clone()
+        baseline = self._run_baseline(
+            *inputs[:5], baseline_state, inputs[6], H, HV, K, V, lower_bound=-0.01
+        )
+        packed = self._run_packed(
+            *inputs[:5], packed_state, inputs[6], HV, K, V, lower_bound=-0.01
+        )
+        self.assertTrue(torch.allclose(packed, baseline, rtol=1e-3, atol=1e-4))
+        self.assertTrue(torch.allclose(packed_state, baseline_state))
 
     def _check(self, B, H, HV, K, V):
         device = get_device()

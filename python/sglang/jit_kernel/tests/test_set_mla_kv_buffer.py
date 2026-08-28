@@ -119,6 +119,7 @@ def test_set_mla_kv_buffer_empty_loc():
 def test_can_use_set_mla_kv_buffer():
     assert can_use_set_mla_kv_buffer(1024, 128)  # bf16 (512,64)
     assert can_use_set_mla_kv_buffer(528, 128)  # fp8 byte layout
+    assert not can_use_set_mla_kv_buffer(1024, 0)  # zero-RoPE model
     assert not can_use_set_mla_kv_buffer(13, 8)  # not multiple of 4
 
 

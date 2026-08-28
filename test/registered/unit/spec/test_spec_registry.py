@@ -45,6 +45,14 @@ class TestFromString(_RegistryIsolated):
             SpeculativeAlgorithm.from_string("eagle"), SpeculativeAlgorithm.EAGLE
         )
 
+    def test_nextn_alias_resolves_to_eagle(self):
+        self.assertIs(
+            SpeculativeAlgorithm.from_string("NEXTN"), SpeculativeAlgorithm.EAGLE
+        )
+        self.assertIs(
+            SpeculativeAlgorithm.from_string("nextn"), SpeculativeAlgorithm.EAGLE
+        )
+
     def test_unknown_name_raises(self):
         with self.assertRaisesRegex(ValueError, "Unknown speculative algorithm"):
             SpeculativeAlgorithm.from_string("NOT_REGISTERED")

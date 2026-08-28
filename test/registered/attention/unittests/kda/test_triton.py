@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.kda_attention import (
     KDAAttentionCase,
+    build_kda_attention_fixture,
     make_kda_cases,
     run_kda_attention_case,
 )
@@ -167,6 +168,14 @@ class TestTritonKDABackendCorrectness(CustomTestCase):
         for case in self.CASES:
             with self.subTest(case=case.name, backend=case.backend):
                 run_kda_attention_case(self, case)
+
+    def test_prefix_cache_conv_window_shape(self):
+        fixture = build_kda_attention_fixture(self, self.CASES[0])
+        conv = fixture.runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
+        self.assertEqual(
+            fixture.backend.linear_attn_backend.conv_states_shape,
+            conv.transpose(-1, -2).shape,
+        )
 
     # Layout-robustness. See dense/test_triton.py for the rationale.
     LAYOUT_ROBUSTNESS_CASES = (

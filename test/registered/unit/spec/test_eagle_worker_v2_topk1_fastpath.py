@@ -8,11 +8,13 @@ slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
-from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
+from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -54,6 +56,20 @@ def _make_worker(num_steps: int, num_draft_tokens: int):
     return worker
 
 
+def _make_backend_factory(decode_backend, draft_extend_backend):
+    class FakeDraftBackendFactory:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def create_decode_backend(self):
+            return decode_backend
+
+        def create_draft_extend_backend(self):
+            return draft_extend_backend
+
+    return FakeDraftBackendFactory
+
+
 class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
     def test_fast_path_matches_slow_path(self):
         bs = 3
@@ -88,6 +104,82 @@ class TestEagleWorkerV2Topk1FastPath(CustomTestCase):
         worker = _make_worker(num_steps=3, num_draft_tokens=3)
         with self.assertRaises(AssertionError):
             worker._rebuild_topk1_chain_buffers()
+
+
+class TestEagleWorkerV2BackendSwitch(CustomTestCase):
+    def test_init_uses_draft_extend_backend(self):
+        worker = object.__new__(EagleDraftWorker)
+        decode_backend = object()
+        extend_backend = object()
+        worker.server_args = SimpleNamespace()
+        worker.draft_runner = SimpleNamespace(attn_backend=object())
+        worker.topk = 1
+        worker.speculative_num_steps = 2
+
+        with patch(
+            "sglang.srt.speculative.eagle_worker_v2.DraftBackendFactory",
+            _make_backend_factory(decode_backend, extend_backend),
+        ):
+            worker.init_attention_backend()
+
+        self.assertIs(worker.draft_runner.draft_attn_backend, decode_backend)
+        self.assertIs(worker.draft_runner.attn_backend, extend_backend)
+
+    @staticmethod
+    def _make_adaptive_worker(runner_backend):
+        draft_worker = SimpleNamespace(
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            draft_attn_backend=object(),
+            draft_extend_attn_backend=object(),
+            cuda_graph_runner=object(),
+            cuda_graph_runner_for_draft_extend=object(),
+            draft_runner=SimpleNamespace(
+                draft_attn_backend=object(), attn_backend=runner_backend
+            ),
+            _rebuild_topk1_chain_buffers=lambda: None,
+        )
+        worker = object.__new__(EAGLEWorkerV2)
+        worker._draft_worker = draft_worker
+        worker._target_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=object(), graph_runner=object())
+        )
+        worker.speculative_num_steps = 2
+        worker.speculative_num_draft_tokens = 3
+        worker.server_args = SimpleNamespace(
+            speculative_num_steps=2,
+            speculative_num_draft_tokens=3,
+            cuda_graph_bs=None,
+            disable_cuda_graph=False,
+        )
+        return worker, draft_worker
+
+    def test_override_restores_runner_backend(self):
+        initial_backend = object()
+        worker, draft_worker = self._make_adaptive_worker(initial_backend)
+
+        with worker._override_worker_state(3, 4):
+            draft_worker.draft_runner.attn_backend = object()
+
+        self.assertIs(draft_worker.draft_runner.attn_backend, initial_backend)
+
+    def test_apply_updates_runner_backend(self):
+        extend_backend = object()
+        worker, draft_worker = self._make_adaptive_worker(object())
+        state = SpecRuntimeState(
+            speculative_num_steps=3,
+            speculative_num_draft_tokens=4,
+            draft_attn_backend=object(),
+            cuda_graph_runner=object(),
+            target_attn_backend=object(),
+            target_graph_runner=object(),
+            draft_extend_attn_backend=extend_backend,
+            cuda_graph_runner_for_draft_extend=object(),
+        )
+
+        worker.apply_runtime_state(state)
+
+        self.assertIs(draft_worker.draft_runner.attn_backend, extend_backend)
 
 
 if __name__ == "__main__":
