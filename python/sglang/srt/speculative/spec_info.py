@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 import torch
 
 from sglang.srt.speculative.spec_registry import (
+    _RESERVED_ALIASES,
     CustomSpecAlgo,
     ServerArgsValidator,
     WorkerFactory,
@@ -51,6 +52,8 @@ class SpeculativeAlgorithm(Enum):
             return cls[upper]
         except KeyError:
             pass
+        if upper in _RESERVED_ALIASES:
+            return cls.EAGLE
         spec = _get_registered_spec(upper)
         if spec is not None:
             return spec

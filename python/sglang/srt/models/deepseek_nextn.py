@@ -156,6 +156,7 @@ class DeepseekModelNextN(nn.Module):
             is_nextn=True,
             prefix=add_prefix(layer_name, prefix),
             alt_stream=self.alt_stream,
+            skip_rope=config.qk_rope_head_dim == 0,
             dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
             mla_enable_prefill_cp=self.mla_enable_prefill_cp,
         )
@@ -231,13 +232,22 @@ class DeepseekModelNextN(nn.Module):
                     residual,
                     zero_allocator,
                     prev_topk_indices=(
-                        forward_batch.topk_indices
-                        if forward_batch.reuse_mtp_topk_indices
+                        forward_batch.spec_info.dsa_topk_indices
+                        if forward_batch.reuse_dsa_topk_indices
                         else None
                     ),
                 )
-                if forward_batch.reuse_mtp_topk_indices:
-                    forward_batch.topk_indices = topk_indices
+                if forward_batch.reuse_dsa_topk_indices:
+                    forward_batch.spec_info.dsa_topk_indices = topk_indices
+
+                if forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+                    seed_buf = forward_batch.spec_info.dsa_seed_topk_capture
+                    if seed_buf is not None and topk_indices is not None:
+                        select = forward_batch.spec_info.dsa_seed_topk_select
+                        source = (
+                            topk_indices if select is None else topk_indices[select]
+                        )
+                        seed_buf[: source.shape[0]].copy_(source)
 
             if not forward_batch.forward_mode.is_idle():
                 if residual is not None:
@@ -271,6 +281,22 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             "model.layers.61": "model.decoder",
         },
     )
+
+    @classmethod
+    def get_hf_to_sglang_mapper(cls, config) -> WeightsMapper:
+        return cls.hf_to_sglang_mapper
+
+    def _resolve_nextn_quant_config(self, config, quant_config):
+        if quant_config is None or quant_config.get_name() != "quark":
+            return quant_config
+
+        from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
+
+        ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
+        mapped_prefix = self.get_hf_to_sglang_mapper(config)._map_name(ckpt_prefix)
+        if should_ignore_layer(mapped_prefix, quant_config.exclude_layers):
+            return None
+        return quant_config
 
     def __init__(
         self,
@@ -318,17 +344,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             self.cp_rank = None
             self.cp_size = None
 
-        nextn_quant_config = quant_config
-        # For quark, if the MTP layer is listed in exclude_layers, set quant_config to None.
-        if nextn_quant_config is not None and nextn_quant_config.get_name() == "quark":
-            from sglang.srt.layers.quantization.quark.utils import (
-                should_ignore_layer,
-            )
-
-            ckpt_prefix = f"model.layers.{config.num_hidden_layers}"
-            mapped_prefix = self.hf_to_sglang_mapper._map_name(ckpt_prefix)
-            if should_ignore_layer(mapped_prefix, nextn_quant_config.exclude_layers):
-                nextn_quant_config = None
+        nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(
             config, nextn_quant_config, prefix=add_prefix("model", prefix)

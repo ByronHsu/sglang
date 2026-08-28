@@ -1862,6 +1862,7 @@ class ServerArgs:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForConditionalGeneration",
         ]:
             # Set attention backend for DeepSeek
             if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
@@ -2681,9 +2682,8 @@ class ServerArgs:
             )
 
     def _resolve_glm5_next_mamba_scheduler_strategy(self, model_arch: str):
-        if (
-            model_arch == "Glm5NextForConditionalGeneration"
-            and getattr(self, "_mamba_scheduler_strategy_was_auto", False)
+        if model_arch == "Glm5NextForConditionalGeneration" and getattr(
+            self, "_mamba_scheduler_strategy_was_auto", False
         ):
             self.mamba_scheduler_strategy = "extra_buffer"
 
@@ -4293,6 +4293,7 @@ class ServerArgs:
                         "MistralLarge3ForCausalLM",
                         "PixtralForConditionalGeneration",
                         "GlmMoeDsaForCausalLM",
+                        "Glm5NextForConditionalGeneration",
                     ]
                 except Exception:
                     pass
@@ -8260,6 +8261,8 @@ def auto_choose_speculative_params(self: ServerArgs):
     if arch in ["LlamaForCausalLM"]:
         # The default value for llama
         return (5, 4, 8)
+    elif arch == "Glm5NextForConditionalGeneration":
+        return (5, 1, 6)
     elif arch in [
         "DeepseekV32ForCausalLM",
         "DeepseekV3ForCausalLM",

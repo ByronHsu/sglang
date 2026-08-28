@@ -1196,6 +1196,11 @@ class CudaGraphRunner:
                     forward_batch.input_embeds
                 )
 
+        if forward_batch.forward_mode.is_decode():
+            read_done = self.device_module.Event()
+            read_done.record()
+            self.model_runner.war_fastpath_read_done_event = read_done
+
         # Replay
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"

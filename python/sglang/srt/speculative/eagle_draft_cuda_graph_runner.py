@@ -57,6 +57,7 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
     hidden_states: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+    dsa_seed_topk: Optional[torch.Tensor] = None
 
 
 class EAGLEDraftCudaGraphRunner:
@@ -152,6 +153,14 @@ class EAGLEDraftCudaGraphRunner:
                 if _hidden_size is not None
                 else None
             )
+            dsa_seed_topk = (
+                torch.zeros(
+                    (self.max_bs, self.eagle_worker.dsa_seed_topk_width),
+                    dtype=torch.int32,
+                )
+                if self.eagle_worker.seed_dsa_topk_from_draft_extend
+                else None
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -187,6 +196,7 @@ class EAGLEDraftCudaGraphRunner:
             hidden_states=hidden_states,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            dsa_seed_topk=dsa_seed_topk,
         )
         self.buffers.share_buffers()
 
@@ -203,6 +213,11 @@ class EAGLEDraftCudaGraphRunner:
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if (
+            self.eagle_worker.seed_dsa_topk_from_draft_extend
+            and forward_batch.spec_info.dsa_topk_indices is None
+        ):
+            return False
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -321,6 +336,11 @@ class EAGLEDraftCudaGraphRunner:
             topk_index=topk_index,
             hidden_states=hidden_states,
             capture_hidden_mode=capture_mode,
+            dsa_topk_indices=(
+                buffers.dsa_seed_topk[:num_seqs]
+                if buffers.dsa_seed_topk is not None
+                else None
+            ),
         )
 
         # Forward batch
@@ -365,11 +385,13 @@ class EAGLEDraftCudaGraphRunner:
 
             output_cache_loc_backup = forward_batch.out_cache_loc
             hidden_states_backup = forward_batch.spec_info.hidden_states
+            dsa_topk_indices_backup = forward_batch.spec_info.dsa_topk_indices
 
             ret = self.eagle_worker.draft_forward(forward_batch)
 
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
+            forward_batch.spec_info.dsa_topk_indices = dsa_topk_indices_backup
             forward_batch.positions.sub_(self.eagle_worker.speculative_num_steps - 1)
             return ret
 
@@ -428,6 +450,8 @@ class EAGLEDraftCudaGraphRunner:
             buffers.topk_index.zero_()
             if buffers.hidden_states is not None:
                 buffers.hidden_states.zero_()
+            if buffers.dsa_seed_topk is not None:
+                buffers.dsa_seed_topk.zero_()
             buffers.req_pool_indices.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
@@ -464,6 +488,12 @@ class EAGLEDraftCudaGraphRunner:
                 0, self.model_runner.model_config.vocab_size - 1
             )
         )
+        if buffers.dsa_seed_topk is not None:
+            seed = forward_batch.spec_info.dsa_topk_indices
+            if seed is None:
+                buffers.dsa_seed_topk[:raw_bs].zero_()
+            else:
+                buffers.dsa_seed_topk[:raw_bs].copy_(seed)
         if (
             buffers.hidden_states is not None
             and forward_batch.spec_info.hidden_states is not None
@@ -506,6 +536,8 @@ class EAGLEDraftCudaGraphRunner:
 
         # Replay
         self._replay(forward_batch)
+        if buffers.dsa_seed_topk is not None:
+            forward_batch.spec_info.dsa_topk_indices = None
         out = self.output_buffers[bs]
 
         if bs != raw_bs:

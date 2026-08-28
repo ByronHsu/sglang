@@ -29,6 +29,10 @@ class BaseSpecWorker(ABC):
         pass
 
     @property
+    def war_fastpath_runner(self):
+        return self.target_worker.model_runner
+
+    @property
     def spec_v2_attn_backends(self) -> tuple:
         """Attn backends touched by spec_v2 forward; OR-ed by decide_needs_cpu_seq_lens.
         Default returns target only; subclasses extend with draft backends."""

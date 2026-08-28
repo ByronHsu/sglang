@@ -1451,9 +1451,20 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         # WAR barrier is CUDA-only; other platforms keep the pre-barrier behavior.
-        self._war_barrier_enabled = is_cuda()
+        self._war_barrier_enabled = is_cuda() and not self.spec_algorithm.is_dflash()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
+
+    def _apply_war_barrier(self):
+        if not self._war_barrier_enabled:
+            return
+        runner = self.model_worker.war_fastpath_runner
+        read_done = runner.war_fastpath_read_done_event
+        if read_done is not None:
+            self.schedule_stream.wait_event(read_done)
+            runner.war_fastpath_read_done_event = None
+        else:
+            self.schedule_stream.wait_stream(self.forward_stream)
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -1501,9 +1512,8 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
-            # WAR barrier: this iter's schedule writes to shared GPU buffers wait for prev forward's reads.
-            if self._war_barrier_enabled:
-                self.schedule_stream.wait_stream(self.forward_stream)
+            # Wait only until the prior forward has snapshotted shared buffers.
+            self._apply_war_barrier()
 
             # Get the next batch to run
             batch = self.get_next_batch_to_run()

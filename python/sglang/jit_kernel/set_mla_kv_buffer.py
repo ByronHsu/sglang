@@ -49,6 +49,8 @@ def can_use_set_mla_kv_buffer(nope_bytes: int, rope_bytes: int) -> bool:
     16; both halves individually must also be a multiple of 4 (the warp-coop
     smem load lower bound).
     """
+    if nope_bytes <= 0 or rope_bytes <= 0:
+        return False
     if nope_bytes % 4 != 0 or rope_bytes % 4 != 0:
         logger.warning(
             "Unsupported nope_bytes=%d rope_bytes=%d for JIT set_mla_kv_buffer:"

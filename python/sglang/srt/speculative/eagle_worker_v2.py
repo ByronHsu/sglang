@@ -5,6 +5,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
     EAGLEDraftExtendNpuGraphRunner,
@@ -14,6 +15,7 @@ from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner i
 )
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -187,6 +189,8 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Alias for better readability
         self.draft_runner = self.draft_worker.model_runner
+        self._init_dsa_index_share_state()
+        self.dsa_extend_topk_buf: Optional[torch.Tensor] = None
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
             eagle_config = getattr(
@@ -221,6 +225,22 @@ class EagleDraftWorker(BaseDraftWorker):
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    def _init_dsa_index_share_state(self) -> None:
+        hf_config = self.draft_runner.model_config.hf_config
+        self.index_share_for_mtp_iteration = (
+            getattr(hf_config, "index_share_for_mtp_iteration", False)
+            and self.topk == 1
+        )
+        self.dsa_index_topk = getattr(hf_config, "index_topk", None)
+        self.dsa_seed_topk_width = (
+            get_dsa_mtp_topk_width(hf_config)
+            if self.dsa_index_topk is not None
+            else None
+        )
+        self.seed_dsa_topk_from_draft_extend = (
+            self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
+        )
 
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
@@ -316,6 +336,8 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
+        if self.draft_extend_attn_backend is not None:
+            self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
     def init_cuda_graphs(self):
@@ -534,6 +556,13 @@ class EagleDraftWorker(BaseDraftWorker):
 
         # Forward multiple steps
         scores = None
+        if self.index_share_for_mtp_iteration:
+            forward_batch.reuse_dsa_topk_indices = True
+            if not (
+                self.seed_dsa_topk_from_draft_extend
+                and spec_info.dsa_topk_indices is not None
+            ):
+                spec_info.dsa_topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
                 i, topk_p, topk_index, hidden_states, scores, self.topk
@@ -600,6 +629,10 @@ class EagleDraftWorker(BaseDraftWorker):
                 topk_index = self.hot_token_id[topk_index]
             hidden_states = logits_output.hidden_states
             forward_batch.positions.add_(1)
+
+        if self.index_share_for_mtp_iteration:
+            spec_info.dsa_topk_indices = None
+            forward_batch.reuse_dsa_topk_indices = False
 
         # Organize the results
         if (
@@ -676,6 +709,20 @@ class EagleDraftWorker(BaseDraftWorker):
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
 
+        seed_from_extend = (
+            self.seed_dsa_topk_from_draft_extend
+            and not forward_batch.forward_mode.is_idle()
+            and not dsa_use_prefill_cp(forward_batch)
+        )
+        if seed_from_extend:
+            batch_size = forward_batch.batch_size
+            forward_batch.spec_info.dsa_seed_topk_capture = (
+                self._get_dsa_extend_topk_buf(batch_size)
+            )
+            forward_batch.spec_info.dsa_seed_topk_select = (
+                torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+            ).long()
+
         canary_ctx = (
             context_tuple(
                 c.with_ops_outside_graph(
@@ -692,13 +739,31 @@ class EagleDraftWorker(BaseDraftWorker):
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
+        prefill_dsa_topk = None
+        if seed_from_extend:
+            prefill_dsa_topk = self.dsa_extend_topk_buf[:batch_size].clone()
+
         # Update spec_info for the next draft step
         probs = torch.softmax(logits_output.next_token_logits, dim=-1)
         next_draft_input.topk_p, next_draft_input.topk_index = fast_topk(
             probs, self.topk, dim=-1
         )
         next_draft_input.hidden_states = logits_output.hidden_states
+        next_draft_input.dsa_topk_indices = prefill_dsa_topk
         return next_draft_input
+
+    def _get_dsa_extend_topk_buf(self, num_tokens: int) -> torch.Tensor:
+        """Lazily grow the eager draft-extend MTP seed buffer."""
+        buffer = self.dsa_extend_topk_buf
+        if buffer is None or buffer.shape[0] < num_tokens:
+            buffer = torch.full(
+                (num_tokens, self.dsa_seed_topk_width),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.dsa_extend_topk_buf = buffer
+        return buffer[:num_tokens]
 
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
@@ -745,6 +810,11 @@ class EagleDraftWorker(BaseDraftWorker):
             and self.cuda_graph_runner_for_draft_extend.can_run(forward_batch)
         )
 
+        if self.seed_dsa_topk_from_draft_extend and not can_cuda_graph:
+            forward_batch.spec_info.dsa_seed_topk_capture = (
+                self._get_dsa_extend_topk_buf(forward_batch.input_ids.shape[0])
+            )
+
         canary_ctx = (
             context_tuple(
                 c.with_ops_outside_graph(
@@ -774,6 +844,16 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_logits_output.next_token_logits,
             f"draft_extend_for_decode (cuda_graph={can_cuda_graph})",
         )
+
+        dsa_seed_topk_indices = None
+        if self.seed_dsa_topk_from_draft_extend:
+            if can_cuda_graph:
+                dsa_capture = (
+                    self.cuda_graph_runner_for_draft_extend.buffers.dsa_seed_topk_capture
+                )
+            else:
+                dsa_capture = forward_batch.spec_info.dsa_seed_topk_capture
+            dsa_seed_topk_indices = dsa_capture[select_index]
 
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
@@ -808,6 +888,7 @@ class EagleDraftWorker(BaseDraftWorker):
             ret_topk_index,
             ret_hidden_states,
         )
+        next_draft_input.dsa_topk_indices = dsa_seed_topk_indices
 
 
 class EAGLEWorkerV2(BaseSpecWorker):
@@ -910,6 +991,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self._draft_worker.draft_attn_backend,
             self._draft_worker.draft_extend_attn_backend,
         )
+
+    @property
+    def war_fastpath_runner(self):
+        return self._draft_worker.draft_runner
 
     @property
     def target_worker(self):
@@ -1097,6 +1182,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         dw.draft_runner.draft_attn_backend = state.draft_attn_backend
         dw.cuda_graph_runner = state.cuda_graph_runner
         dw.draft_extend_attn_backend = state.draft_extend_attn_backend
+        if state.draft_extend_attn_backend is not None:
+            dw.draft_runner.attn_backend = state.draft_extend_attn_backend
         dw.cuda_graph_runner_for_draft_extend = state.cuda_graph_runner_for_draft_extend
         dw._rebuild_topk1_chain_buffers()
 
@@ -1128,6 +1215,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             dw.draft_attn_backend,
             dw.draft_extend_attn_backend,
             dw.draft_runner.draft_attn_backend,
+            dw.draft_runner.attn_backend,
             dw.cuda_graph_runner,
             dw.cuda_graph_runner_for_draft_extend,
             sa.speculative_num_steps,
@@ -1163,6 +1251,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 dw.draft_attn_backend,
                 dw.draft_extend_attn_backend,
                 dw.draft_runner.draft_attn_backend,
+                dw.draft_runner.attn_backend,
                 dw.cuda_graph_runner,
                 dw.cuda_graph_runner_for_draft_extend,
                 sa.speculative_num_steps,
@@ -1274,12 +1363,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
         ) = verify_input.sample(batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
-        # Update mamba state for hybrid GDN models after verification
-        if (
-            self.target_worker.model_runner.hybrid_gdn_config is not None
-            or self.target_worker.model_runner.mamba2_config is not None
-            or self.target_worker.model_runner.hybrid_lightning_config is not None
-        ):
+        # Commit accepted recurrent state after speculative verification.
+        if self.target_worker.model_runner.mambaish_config is not None:
             self._mamba_verify_update(batch, accept_lens, accept_index, bs)
 
         if not batch.forward_mode.is_idle():
@@ -1334,7 +1419,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         accept_index: torch.Tensor,
         bs: int,
     ):
-        """Update mamba state for hybrid GDN models after verification."""
+        """Commit accepted state for hybrid recurrent models after verification."""
         # `accept_lens` already includes the bonus token (drafts + 1 per req).
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
             accept_indices_offset = torch.arange(

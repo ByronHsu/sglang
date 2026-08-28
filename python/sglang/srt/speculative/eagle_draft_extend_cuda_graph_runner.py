@@ -43,6 +43,20 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 
 
+def resolve_draft_extend_seq_len_fill_value(
+    attn_backend, captured_req_width: int
+) -> int:
+    """DRAFT_EXTEND_V2 subtracts the fixed draft width when building the KPool
+    write plan; padding rows need enough synthetic history for that subtraction
+    plus the KPool offset."""
+    fill_value = attn_backend.get_cuda_graph_seq_len_fill_value()
+    full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+    dsa_index_kpool = getattr(full_attn_backend, "dsa_index_kpool", 1)
+    if dsa_index_kpool > 1:
+        fill_value = max(fill_value, captured_req_width + dsa_index_kpool)
+    return fill_value
+
+
 @dataclass
 class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     input_ids: torch.Tensor
@@ -59,6 +73,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     next_token_logits_buffer: torch.Tensor
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+    dsa_seed_topk_capture: Optional[torch.Tensor] = None
 
 
 class EAGLEDraftExtendCudaGraphRunner:
@@ -111,14 +126,15 @@ class EAGLEDraftExtendCudaGraphRunner:
         # Size cuda-graph buffers by num_draft_tokens (full tree width), not
         # num_steps + 1, or topk > 1 draft-extend overflows them.
         self.num_tokens_per_bs = model_runner.server_args.speculative_num_draft_tokens
+        self.captured_req_width = self.num_tokens_per_bs
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
         self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
-        self.seq_len_fill_value = (
-            self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
+        self.seq_len_fill_value = resolve_draft_extend_seq_len_fill_value(
+            self.draft_extend_attn_backend, self.captured_req_width
         )
         seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
@@ -147,8 +163,8 @@ class EAGLEDraftExtendCudaGraphRunner:
                 if _hidden_size is not None
                 else None
             )
-            self.seq_len_fill_value = (
-                self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+            self.seq_len_fill_value = resolve_draft_extend_seq_len_fill_value(
+                self.draft_extend_attn_backend, self.captured_req_width
             )
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
@@ -203,6 +219,15 @@ class EAGLEDraftExtendCudaGraphRunner:
                 ),
                 dtype=torch.float,
             )
+            dsa_seed_topk_capture = (
+                torch.full(
+                    (self.max_num_token, self.eagle_worker.dsa_seed_topk_width),
+                    -1,
+                    dtype=torch.int32,
+                )
+                if self.eagle_worker.seed_dsa_topk_from_draft_extend
+                else None
+            )
 
         self.buffers = EagleDraftExtendInputBuffers(
             input_ids=input_ids,
@@ -219,6 +244,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             next_token_logits_buffer=next_token_logits_buffer,
             global_num_tokens_gpu=global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob_gpu,
+            dsa_seed_topk_capture=dsa_seed_topk_capture,
         )
         self.buffers.share_buffers()
 
@@ -347,6 +373,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             hidden_states=hidden_states,
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=num_accept_tokens,
+            dsa_seed_topk_capture=(
+                buffers.dsa_seed_topk_capture[:num_tokens]
+                if buffers.dsa_seed_topk_capture is not None
+                else None
+            ),
         )
 
         # Forward batch
@@ -545,6 +576,10 @@ class EAGLEDraftExtendCudaGraphRunner:
             spec_info=forward_batch.spec_info,
         )
         self.draft_extend_attn_backend.init_forward_metadata_out_graph(fb_view)
+
+        read_done = self.device_module.Event()
+        read_done.record()
+        self.model_runner.war_fastpath_read_done_event = read_done
 
         # Replay
         self.raw_bs = raw_bs

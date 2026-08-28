@@ -16,6 +16,7 @@ from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
     fused_mamba_state_scatter_with_mask,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -785,6 +786,10 @@ class HybridLinearAttnBackend(AttentionBackend):
     def _is_full_attn(
         self, layer: Optional[RadixAttention], layer_id: Optional[int] = None
     ) -> bool:
+        # Adaptive NEXTN rebuilds target backends while the draft worker is active.
+        # Preserve the layer's explicit linear-attention signal in that window.
+        if isinstance(layer, RadixLinearAttention):
+            return False
         if layer is not None:
             layer_id = layer.layer_id
         assert layer_id is not None, "either layer or layer_id must be provided"

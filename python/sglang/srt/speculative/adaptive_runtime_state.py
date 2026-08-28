@@ -118,12 +118,12 @@ class AdaptiveController:
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> None:
-        """Feed verify results; switch runtime state if EMA warrants it."""
-        new_step = self.params.on_verify_complete(
-            num_correct_drafts_per_req, batch_size
-        )
-        if new_step is not None:
-            self._activate(new_step)
+        """Feed verify results; the next batch activates the selected state.
+
+        CPU result processing may overlap the current batch's draft-extend stage.
+        Mutating its shape-dependent runtime state here would mix draft widths.
+        """
+        self.params.on_verify_complete(num_correct_drafts_per_req, batch_size)
 
     def _activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)

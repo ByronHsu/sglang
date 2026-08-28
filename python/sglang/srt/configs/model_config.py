@@ -110,6 +110,7 @@ def is_deepseek_dsa(config) -> bool:
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
             "Glm5NextForConditionalGeneration",
+            "Glm5NextForConditionalGenerationNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -469,6 +470,15 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "Glm4MoeLiteForCausalLMNextN"
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Glm5NextForConditionalGeneration"
+        ):
+            self.hf_config.architectures[0] = "Glm5NextForConditionalGenerationNextN"
+            self.hf_text_config.architectures = list(self.hf_config.architectures)
+            self.hf_text_config.num_nextn_predict_layers = 1
+            self.hf_text_config.linear_attn_config = None
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "GlmOcrForConditionalGeneration",
         ]:
@@ -655,6 +665,7 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
+            or "Glm5NextForConditionalGenerationNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
@@ -828,12 +839,20 @@ class ModelConfig:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
+        is_glm5_next = getattr(self.hf_text_config, "model_type", None) in (
+            "glm5_next",
+            "glm5_next_text",
+        )
+        if is_glm5_next and not getattr(self.hf_text_config, "mhc", False):
+            hc_mult = 1
         self.spec_hidden_size = (
-            self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
+            self.hidden_size * hc_mult
+            if hc_mult > 1 and not is_glm5_next
+            else self.hidden_size
         )
         # mHC-flattened hidden size; None when not running an mHC model
         # (e.g. non-DeepSeek-V4 configs without ``hc_mult``).
-        self.hc_hidden_size = self.spec_hidden_size if hc_mult > 1 else None
+        self.hc_hidden_size = self.hidden_size * hc_mult if hc_mult > 1 else None
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
@@ -1629,6 +1648,7 @@ piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLM",
     "DeepseekV4ForCausalLMNextN",
     "Qwen3NextForCausalLM",
+    "Glm5NextForConditionalGeneration",
     "BailingMoeV2_5ForCausalLM",
     "LLaDAModelLM",
 ]

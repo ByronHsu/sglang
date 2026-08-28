@@ -57,6 +57,7 @@ class KDAKernelDispatcher:
                 f"Unsupported KDA decode backend: {decode_backend}. "
                 "KDA currently only supports 'triton'."
             )
+        self.verify_kernel = triton_kernel
 
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
@@ -72,6 +73,7 @@ class KDAKernelDispatcher:
 
         rank0_log(
             f"KDA kernel dispatcher: decode={self.decode_kernel.__class__.__name__}, "
+            f"verify={self.verify_kernel.__class__.__name__}, "
             f"extend={self.extend_kernel.__class__.__name__} "
             f"packed_decode={self.supports_packed_decode}"
         )
@@ -138,6 +140,43 @@ class KDAKernelDispatcher:
             **kwargs,
         )
 
+    def target_verify(
+        self,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        *,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        intermediate_states_buffer: torch.Tensor,
+        intermediate_state_indices: torch.Tensor,
+        cache_steps: int,
+        retrieve_parent_token: Optional[torch.Tensor],
+        lower_bound: Optional[float] = None,
+    ) -> torch.Tensor:
+        return self.verify_kernel.target_verify(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            intermediate_states_buffer=intermediate_states_buffer,
+            intermediate_state_indices=intermediate_state_indices,
+            cache_steps=cache_steps,
+            retrieve_parent_token=retrieve_parent_token,
+            lower_bound=lower_bound,
+        )
+
     def extend(
         self,
         q: torch.Tensor,
@@ -177,6 +216,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
         self.kernel_dispatcher = KDAKernelDispatcher(decode_backend, prefill_backend)
+        self.verify_intermediate_state_indices = torch.arange(
+            self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
+        )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
@@ -222,10 +264,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # token-per-seq speculative paths (target_verify / draft_extend) go
         # through forward_extend instead. Assert the invariant so a future
         # routing change fails loudly rather than silently corrupting state.
-        if (
-            self.kernel_dispatcher.supports_packed_decode
-            and lower_bound is None
-        ):
+        if self.kernel_dispatcher.supports_packed_decode and lower_bound is None:
             assert qkv.shape[0] == cache_indices.shape[0], (
                 "KDA packed decode requires one token per sequence (T=1): "
                 f"got {qkv.shape[0]} tokens for {cache_indices.shape[0]} requests."
@@ -280,6 +319,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
+        if forward_batch.forward_mode.is_target_verify():
+            return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
+
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
@@ -361,3 +403,69 @@ class KDAAttnBackend(MambaAttnBackendBase):
             core_attn_out = torch.cat((core_attn_out, padding), dim=1)
 
         return core_attn_out
+
+    def _forward_target_verify(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+    ):
+        metadata = self.forward_metadata
+        seq_len = mixed_qkv.shape[0]
+        query_start_loc = metadata.query_start_loc
+        cache_indices = metadata.mamba_cache_indices
+
+        cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        conv_states = cache.conv[0]
+        ssm_states = cache.temporal
+        intermediate_ssm = getattr(cache, "intermediate_ssm", None)
+        if intermediate_ssm is None:
+            raise RuntimeError("KDA target_verify requires a speculative mamba cache")
+        intermediate_conv = cache.intermediate_conv_window[0]
+
+        draft_tokens = forward_batch.spec_info.draft_token_num
+        batch_size = seq_len // draft_tokens
+        mixed_qkv = (
+            causal_conv1d_update(
+                mixed_qkv.view(batch_size, draft_tokens, -1).transpose(1, 2),
+                conv_states.transpose(-1, -2),
+                layer.conv_weights,
+                layer.bias,
+                activation="silu",
+                conv_state_indices=cache_indices[:batch_size],
+                intermediate_conv_window=intermediate_conv.transpose(-1, -2),
+                intermediate_state_indices=self.verify_intermediate_state_indices[
+                    :batch_size
+                ],
+                retrieve_next_token=metadata.retrieve_next_token,
+                retrieve_next_sibling=metadata.retrieve_next_sibling,
+                retrieve_parent_token=metadata.retrieve_parent_token,
+            )
+            .transpose(1, 2)
+            .reshape(seq_len, -1)
+        )
+
+        q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
+        q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)
+        k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)
+        v = v.unflatten(-1, (-1, layer.head_v_dim)).unsqueeze(0)
+
+        return self.kernel_dispatcher.target_verify(
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            q=q,
+            k=k,
+            v=v,
+            a=a,
+            b=b,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            intermediate_states_buffer=intermediate_ssm,
+            intermediate_state_indices=self.verify_intermediate_state_indices,
+            cache_steps=draft_tokens,
+            retrieve_parent_token=metadata.retrieve_parent_token,
+            lower_bound=getattr(layer, "lower_bound", None),
+        )

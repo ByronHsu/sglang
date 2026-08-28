@@ -42,8 +42,8 @@ from sglang.srt.compilation.piecewise_context_manager import (
 from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
-    GraniteMoeHybridConfig,
     Glm5NextConfig,
+    GraniteMoeHybridConfig,
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -568,6 +568,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
+
+        # A decode graph publishes this after copying shared scheduler buffers.
+        self.war_fastpath_read_done_event: Optional[torch.cuda.Event] = None
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
@@ -2364,7 +2367,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     @property
     def glm5_next_config(self):
         config = self.model_config.hf_config
-        if isinstance(config, Glm5NextConfig):
+        if isinstance(config, Glm5NextConfig) and not self.is_draft_worker:
             return config.text_config
         return None
 

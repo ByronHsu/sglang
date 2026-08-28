@@ -5,9 +5,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.srt.layers.mhc import hc_post as _hc_post_fn
-from sglang.srt.layers.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_maybe_tbo,
 )
@@ -37,6 +34,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
 )
+from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -64,6 +62,8 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.mhc import hc_post as _hc_post_fn
+from sglang.srt.layers.mhc import hc_pre as _hc_pre_fn
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -310,9 +310,7 @@ class Glm5NextLinearAttention(nn.Module):
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         if dsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):
-            hidden_states = cp_plain_all_gather(
-                hidden_states, get_attention_cp_size()
-            )
+            hidden_states = cp_plain_all_gather(hidden_states, get_attention_cp_size())
 
         qkv, _ = self.qkv_proj(hidden_states)
 
@@ -331,9 +329,7 @@ class Glm5NextLinearAttention(nn.Module):
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         if dsa_use_prefill_cp(forward_batch, self.enable_prefill_cp):
-            hidden_states = cp_plain_all_gather(
-                hidden_states, get_attention_cp_size()
-            )
+            hidden_states = cp_plain_all_gather(hidden_states, get_attention_cp_size())
         fused_states = self.fused_qkvbfg_a_proj(hidden_states)
 
         qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
@@ -552,7 +548,9 @@ class Glm5NextDecoderLayer(nn.Module):
                 hc_post=self.hc_post,
             )
             if self.dsa_enable_prefill_cp:
-                raise NotImplementedError("GLM-5.3 MHC with prefill CP is not backported")
+                raise NotImplementedError(
+                    "GLM-5.3 MHC with prefill CP is not backported"
+                )
             self.layer_communicator = MHCLayerCommunicator(
                 **shared_kwargs,
                 **mhc_kwargs,
@@ -1059,30 +1057,41 @@ class Glm5NextForConditionalGeneration(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
-    def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0
-        if get_global_server_args().disable_shared_experts_fusion:
-            return
-
-        disable_reason = None
-        if not getattr(self.config, "n_shared_experts", None):
-            disable_reason = "No shared experts are defined in the config."
-        elif not _is_cuda:
-            disable_reason = "Shared experts fusion currently requires CUDA devices."
-        elif _is_cuda and (_device_sm is not None) and (_device_sm < 80):
-            disable_reason = "Shared experts fusion requires SM80 or newer GPUs."
-        elif get_moe_ep_group().world_size > 1:
-            disable_reason = (
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        text_config = getattr(hf_config, "text_config", hf_config)
+        if not getattr(text_config, "n_shared_experts", None):
+            return "No shared experts are defined in the config."
+        if not _is_cuda:
+            return "Shared experts fusion currently requires CUDA devices."
+        if _device_sm is not None and _device_sm < 80:
+            return "Shared experts fusion requires SM80 or newer GPUs."
+        if get_moe_ep_group().world_size > 1:
+            return (
                 "Shared experts fusion is not supported together with expert "
                 "parallelism yet."
             )
-        elif get_moe_a2a_backend().is_deepep():
-            disable_reason = (
+        if get_moe_a2a_backend().is_deepep():
+            return (
                 "Shared experts fusion is not supported when Deepep MoE backend "
                 "is enabled."
             )
+        return None
+
+    def determine_num_fused_shared_experts(self):
+        self.num_fused_shared_experts = 0
+        server_args = get_global_server_args()
+        if server_args.disable_shared_experts_fusion:
+            return
+
+        disable_reason = type(self).shared_experts_fusion_disable_reason(
+            self.config, self.quant_config
+        )
 
         if disable_reason is not None:
+            # DeepseekV2MoE consumes the global gate while constructing layers.
+            # Keep it aligned with this wrapper's weight-remapping decision.
+            server_args.disable_shared_experts_fusion = True
             log_info_on_rank0(
                 logger,
                 f"{disable_reason} Shared experts fusion optimization is disabled.",

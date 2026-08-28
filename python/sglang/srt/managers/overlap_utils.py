@@ -164,6 +164,14 @@ class FutureMap:
                 dtype=hidden_states0.dtype,
                 device=self.device,
             )
+        self.dsa_topk_indices_buf = None
+        if draft_input.dsa_topk_indices is not None:
+            dsa_topk0 = draft_input.dsa_topk_indices[0]
+            self.dsa_topk_indices_buf = torch.empty(
+                (self.req_pool_size, *dsa_topk0.shape),
+                dtype=dsa_topk0.dtype,
+                device=self.device,
+            )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
         draft_input: EagleDraftInput = batch.spec_info
@@ -191,6 +199,8 @@ class FutureMap:
         )
         if hidden_states is not None:
             draft_input.hidden_states = hidden_states
+        if self.dsa_topk_indices_buf is not None:
+            draft_input.dsa_topk_indices = self.dsa_topk_indices_buf[indices]
         if _DEBUG_ASSERT:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
@@ -276,4 +286,11 @@ class FutureMap:
         if spec_need_hidden_states():
             self.hidden_states_buf[indices] = draft_input.hidden_states.to(
                 self.hidden_states_buf.dtype
+            )
+        if (
+            self.dsa_topk_indices_buf is not None
+            and draft_input.dsa_topk_indices is not None
+        ):
+            self.dsa_topk_indices_buf[indices] = draft_input.dsa_topk_indices.to(
+                self.dsa_topk_indices_buf.dtype
             )
