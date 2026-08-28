@@ -109,6 +109,7 @@ def is_deepseek_dsa(config) -> bool:
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
             "GlmMoeDsaForCausalLM",
+            "Glm5NextForConditionalGeneration",
         )
         and _hf_attr(config, "index_topk") is not None
     )
@@ -250,6 +251,8 @@ class ModelConfig:
         if enable_multimodal is None:
             mm_disabled_models = [
                 "Gemma3ForConditionalGeneration",
+                "Glm5NextForConditionalGeneration",
+                "Glm5NextForConditionalGenerationNextN",
                 "Llama4ForConditionalGeneration",
                 "Step3VLForConditionalGeneration",
             ]
@@ -651,6 +654,7 @@ class ModelConfig:
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLMNextN" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
+            or "Glm5NextForConditionalGeneration" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures

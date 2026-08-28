@@ -1230,7 +1230,10 @@ class ServerArgs:
             self._handle_modelscope_paths()
 
         # Mamba scheduler strategy
-        if self.mamba_scheduler_strategy == "auto":
+        self._mamba_scheduler_strategy_was_auto = (
+            self.mamba_scheduler_strategy == "auto"
+        )
+        if self._mamba_scheduler_strategy_was_auto:
             # TODO: when extra_buffer is more verified, we can set the default path based on
             #       [overlap, non-overlap]
             self.mamba_scheduler_strategy = "no_buffer"
@@ -1827,6 +1830,14 @@ class ServerArgs:
                 model_arch=model_arch,
                 support_mamba_cache=_hybrid_spec.support_mamba_cache,
                 support_mamba_cache_extra_buffer=_hybrid_spec.support_mamba_cache_extra_buffer,
+            )
+
+        if model_arch == "Glm5NextForConditionalGeneration":
+            self._resolve_glm5_next_mamba_scheduler_strategy(model_arch)
+            self._handle_mamba_radix_cache(
+                model_arch=model_arch,
+                support_mamba_cache=True,
+                support_mamba_cache_extra_buffer=True,
             )
 
         if model_arch in [
@@ -2668,6 +2679,13 @@ class ServerArgs:
                 "FlashInfer allreduce fusion is forcibly disabled "
                 "via --enforce-disable-flashinfer-allreduce-fusion."
             )
+
+    def _resolve_glm5_next_mamba_scheduler_strategy(self, model_arch: str):
+        if (
+            model_arch == "Glm5NextForConditionalGeneration"
+            and getattr(self, "_mamba_scheduler_strategy_was_auto", False)
+        ):
+            self.mamba_scheduler_strategy = "extra_buffer"
 
     def _handle_mamba_radix_cache(
         self,

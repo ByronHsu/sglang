@@ -43,6 +43,7 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     FalconH1Config,
     GraniteMoeHybridConfig,
+    Glm5NextConfig,
     InternS2PreviewConfig,
     JetNemotronConfig,
     JetVLMConfig,
@@ -2360,6 +2361,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return config
         return None
 
+    @property
+    def glm5_next_config(self):
+        config = self.model_config.hf_config
+        if isinstance(config, Glm5NextConfig):
+            return config.text_config
+        return None
+
     def _get_linear_attn_registry_result(self):
         if self._linear_attn_registry_cache is _UNSET:
             self._linear_attn_registry_cache = get_linear_attn_config(
@@ -2378,6 +2386,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.mamba2_config
             or self.hybrid_gdn_config
             or self.kimi_linear_config
+            or self.glm5_next_config
             or self.hybrid_lightning_config
         )
         if existing:

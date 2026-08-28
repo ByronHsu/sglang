@@ -223,12 +223,15 @@ class AttentionInputs:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         qkv_latent_func: Callable,
+        *,
+        is_pre_gathered: bool = False,
     ):
         self.hidden_states_local = hidden_states
         self.forward_batch = forward_batch
         self.qkv_latent_func = qkv_latent_func
         self.hidden_states_ = None
         self.qkv_latent_ = None
+        self.is_pre_gathered = is_pre_gathered
 
     def tp_all_gather_hidden_states(self, hidden_states, forward_batch):
         total_tokens = forward_batch.input_ids.shape[0]
@@ -243,7 +246,7 @@ class AttentionInputs:
         self.qkv_latent_ = self.qkv_latent_func(
             self.hidden_states_local, self.forward_batch
         )
-        if get_attn_tp_context().input_scattered:
+        if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
             self.qkv_latent_ = self.tp_all_gather_hidden_states(
                 self.qkv_latent_, self.forward_batch
             )
@@ -253,7 +256,7 @@ class AttentionInputs:
         if self.hidden_states_ is not None:
             return self.hidden_states_
         self.hidden_states_ = self.hidden_states_local
-        if get_attn_tp_context().input_scattered:
+        if get_attn_tp_context().input_scattered and not self.is_pre_gathered:
             self.hidden_states_ = self.tp_all_gather_hidden_states(
                 self.hidden_states_, self.forward_batch
             )
@@ -267,13 +270,13 @@ class AttnTpContext:
         self.attn_inputs_: Optional[AttentionInputs] = None
         self.is_dsa = False
 
-    def init_context(self, q_lora_rank, is_dsa):
+    def init_context(self, q_lora_rank, is_dsa, is_mhc=False):
         self.is_dsa = is_dsa
         self.allow_input_scattered = (
             get_global_server_args().enable_attn_tp_input_scattered
             and (_is_cuda or _is_npu)
             and q_lora_rank is not None
-            and not is_dsa
+            and (is_mhc or not is_dsa)
             and get_tensor_model_parallel_world_size() > 1
             and not is_dp_attention_enabled()
             and get_moe_a2a_backend().is_none()
@@ -305,6 +308,10 @@ class AttnTpContext:
 
     def set_attn_inputs(self, attn_inputs: AttentionInputs):
         self.attn_inputs_ = attn_inputs
+
+    def set_hidden_states_local(self, hidden_states: torch.Tensor) -> None:
+        if self.attn_inputs_ is not None:
+            self.attn_inputs_.hidden_states_local = hidden_states
 
     def fetch_qkv_latent(self):
         assert self.attn_inputs_ is not None
@@ -435,6 +442,22 @@ class LayerScatterModes:
 
 def enable_moe_dense_fully_dp():
     return get_global_server_args().moe_dense_tp_size == 1
+
+
+def tp_reduce_scatter(
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    context: "CommunicateContext",
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if hidden_states.shape[0] == 0:
+        return hidden_states, hidden_states
+    assert hidden_states.shape[0] % context.tp_size == 0
+    local_tokens = hidden_states.shape[0] // context.tp_size
+    output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
+    get_tp_group().reduce_scatter_tensor(output, hidden_states)
+    if residual is not None:
+        residual = residual.tensor_split(context.tp_size)[context.tp_rank]
+    return output, residual
 
 
 class LayerCommunicator:
@@ -665,19 +688,7 @@ class LayerCommunicator:
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if hidden_states.shape[0] == 0:
-            return hidden_states, hidden_states
-        assert (
-            hidden_states.shape[0] % self._context.tp_size == 0
-        ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
-        local_tokens = hidden_states.shape[0] // self._context.tp_size
-        output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
-        get_tp_group().reduce_scatter_tensor(output, hidden_states)
-        if residual is not None:
-            residual = residual.tensor_split(self._context.tp_size)[
-                self._context.tp_rank
-            ]
-        return output, residual
+        return tp_reduce_scatter(hidden_states, residual, self._context)
 
     def prepare_mlp(
         self,
@@ -710,6 +721,13 @@ class LayerCommunicator:
             context=self._context,
             allow_reduce_scatter=self.allow_reduce_scatter,
         )
+
+    def maybe_prefetch_next_full_attention_kv(
+        self,
+        forward_batch: ForwardBatch,
+        next_full_attention_layer_id: Optional[int],
+    ) -> None:
+        return
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if should_disable_reduce_scatter_for_on_policy():
