@@ -37,6 +37,9 @@ class TestGlm5NextTextConfig(CustomTestCase):
         self.assertIsInstance(config.vision_config, Glm5NextVisionConfig)
         self.assertEqual(config.vision_config.projection_intermediate_size, 10240)
         self.assertEqual(config.vision_config.swiglu_limit, 10.0)
+        self.assertEqual(
+            config.vision_config.to_dict()["model_type"], "glm5_next_vision"
+        )
         self.assertIs(_CUSTOMIZED_MM_PROCESSOR["glm5_next"], Glm5NextProcessorCompat)
         self.assertTrue(is_multimodal_model(["Glm5NextForConditionalGeneration"]))
 
