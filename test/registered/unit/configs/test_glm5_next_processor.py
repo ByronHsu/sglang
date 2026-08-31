@@ -24,6 +24,22 @@ class TestGlm5NextProcessor(unittest.TestCase):
         self.assertEqual(output["image_grid_thw"].tolist(), [[1, 8, 8]])
         self.assertEqual(tuple(output["pixel_values"].shape), (64, 1176))
 
+    def test_uint8_rescaling_uses_explicit_processor_policy(self):
+        processor = Glm5NextImageProcessorCompat(
+            min_image_tokens=1,
+            image_mean=[0.0, 0.0, 0.0],
+            image_std=[1.0, 1.0, 1.0],
+        )
+        image = torch.ones(3, 28, 28, dtype=torch.uint8)
+
+        rescaled = processor(image, return_tensors="pt")["pixel_values"]
+        unscaled = processor(image, return_tensors="pt", do_rescale=False)[
+            "pixel_values"
+        ]
+
+        torch.testing.assert_close(rescaled, torch.full_like(rescaled, 1 / 255))
+        torch.testing.assert_close(unscaled, torch.ones_like(unscaled))
+
     def test_resize_preserves_aligned_aspect_ratio(self):
         height, width = smart_resize(400, 800)
 

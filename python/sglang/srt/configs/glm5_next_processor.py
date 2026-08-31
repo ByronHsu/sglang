@@ -90,6 +90,8 @@ class Glm5NextImageProcessorCompat(BaseImageProcessor):
         patch_expand_factor: int = 1,
         min_image_tokens: int = 16,
         max_image_tokens: int = 8000,
+        do_rescale: bool = True,
+        rescale_factor: float = 1 / 255,
         image_mean=None,
         image_std=None,
         **kwargs,
@@ -101,6 +103,8 @@ class Glm5NextImageProcessorCompat(BaseImageProcessor):
         self.patch_expand_factor = patch_expand_factor
         self.min_image_tokens = min_image_tokens
         self.max_image_tokens = max_image_tokens
+        self.do_rescale = do_rescale
+        self.rescale_factor = rescale_factor
         self.image_mean = image_mean or OPENAI_CLIP_MEAN
         self.image_std = image_std or OPENAI_CLIP_STD
 
@@ -125,15 +129,20 @@ class Glm5NextImageProcessorCompat(BaseImageProcessor):
             raise ValueError(
                 f"Expected a 3D image tensor, got shape {tuple(tensor.shape)}"
             )
-        tensor = tensor[:3].to(torch.float32)
-        if tensor.numel() and tensor.max() > 1:
-            tensor = tensor / 255.0
-        return tensor
+        return tensor[:3].to(torch.float32)
 
-    def _preprocess_one(self, image) -> tuple[torch.Tensor, list[int]]:
+    def _preprocess_one(
+        self,
+        image,
+        *,
+        do_rescale: bool,
+        rescale_factor: float,
+    ) -> tuple[torch.Tensor, list[int]]:
         from torchvision.transforms import functional as TF
 
         image = self._to_chw(image)
+        if do_rescale:
+            image = image * rescale_factor
         _, height, width = image.shape
         factor = self.patch_size * self.merge_size * self.patch_expand_factor
         target_height, target_width = smart_resize(
@@ -194,7 +203,16 @@ class Glm5NextImageProcessorCompat(BaseImageProcessor):
     def preprocess(self, images, return_tensors=None, **kwargs) -> BatchFeature:
         if not isinstance(images, (list, tuple)):
             images = [images]
-        processed = [self._preprocess_one(image) for image in images]
+        do_rescale = kwargs.pop("do_rescale", self.do_rescale)
+        rescale_factor = kwargs.pop("rescale_factor", self.rescale_factor)
+        processed = [
+            self._preprocess_one(
+                image,
+                do_rescale=do_rescale,
+                rescale_factor=rescale_factor,
+            )
+            for image in images
+        ]
         return BatchFeature(
             {
                 "pixel_values": torch.cat([item[0] for item in processed]),
