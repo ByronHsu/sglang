@@ -3,10 +3,18 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
+from sglang.srt.configs.glm5_next import (
+    Glm5NextConfig,
+    Glm5NextTextConfig,
+    Glm5NextVisionConfig,
+)
+from sglang.srt.configs.glm5_next_processor import Glm5NextProcessorCompat
 from sglang.srt.configs.mamba_utils import KimiLinearStateShape
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, is_multimodal_model
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.multimodal.customized_mm_processor_utils import (
+    _CUSTOMIZED_MM_PROCESSOR,
+)
 from sglang.srt.server_args import ServerArgs, auto_choose_speculative_params
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -15,6 +23,23 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestGlm5NextTextConfig(CustomTestCase):
+    def test_vision_config_and_processor_are_registered_without_transformers_bump(self):
+        config = Glm5NextConfig(
+            architectures=["Glm5NextForConditionalGeneration"],
+            vision_config={
+                "hidden_size": 1024,
+                "num_heads": 16,
+                "projection_intermediate_size": 10240,
+                "swiglu_limit": 10.0,
+            },
+        )
+
+        self.assertIsInstance(config.vision_config, Glm5NextVisionConfig)
+        self.assertEqual(config.vision_config.projection_intermediate_size, 10240)
+        self.assertEqual(config.vision_config.swiglu_limit, 10.0)
+        self.assertIs(_CUSTOMIZED_MM_PROCESSOR["glm5_next"], Glm5NextProcessorCompat)
+        self.assertTrue(is_multimodal_model(["Glm5NextForConditionalGeneration"]))
+
     def test_outer_config_uses_registered_text_config(self):
         config = Glm5NextConfig(
             architectures=["Glm5NextForConditionalGeneration"],

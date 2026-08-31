@@ -1,8 +1,13 @@
 from typing import List, Optional, Union
 
 from transformers.configuration_utils import PretrainedConfig
+from transformers.models.glm_ocr.configuration_glm_ocr import GlmOcrVisionConfig
 
+from sglang.srt.configs.glm5_next_processor import Glm5NextProcessorCompat
 from sglang.srt.configs.mamba_utils import KimiLinearCacheParams, KimiLinearStateShape
+from sglang.srt.multimodal.customized_mm_processor_utils import (
+    register_customized_processor,
+)
 
 _GLM5_NEXT_TOP_LEVEL_CONFIG_KEYS = (
     "architectures",
@@ -293,9 +298,19 @@ class Glm5NextTextConfig(PretrainedConfig):
         return KimiLinearCacheParams(shape=shape, layers=self.linear_layer_ids)
 
 
+class Glm5NextVisionConfig(GlmOcrVisionConfig):
+    def __init__(self, swiglu_limit: float = 10.0, **kwargs):
+        super().__init__(**kwargs)
+        self.swiglu_limit = swiglu_limit
+
+
+@register_customized_processor(Glm5NextProcessorCompat)
 class Glm5NextConfig(PretrainedConfig):
     model_type = "glm5_next"
-    sub_configs = {"text_config": Glm5NextTextConfig}
+    sub_configs = {
+        "vision_config": Glm5NextVisionConfig,
+        "text_config": Glm5NextTextConfig,
+    }
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -324,8 +339,12 @@ class Glm5NextConfig(PretrainedConfig):
         else:
             self.text_config = text_config
 
-        # The backport intentionally exposes the text architecture only.
-        self.vision_config = None
+        if vision_config is None:
+            self.vision_config = None
+        else:
+            if not isinstance(vision_config, dict):
+                vision_config = vision_config.to_dict()
+            self.vision_config = self.sub_configs["vision_config"](**vision_config)
 
         self.image_token_id = image_token_id
         self.video_token_id = video_token_id

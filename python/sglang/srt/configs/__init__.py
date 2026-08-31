@@ -8,7 +8,11 @@ from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
-from sglang.srt.configs.glm5_next import Glm5NextConfig, Glm5NextTextConfig
+from sglang.srt.configs.glm5_next import (
+    Glm5NextConfig,
+    Glm5NextTextConfig,
+    Glm5NextVisionConfig,
+)
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.interns2preview import InternS2PreviewConfig
 from sglang.srt.configs.janus_pro import MultiModalityConfig
@@ -69,6 +73,7 @@ __all__ = [
     "GraniteMoeHybridConfig",
     "Glm5NextConfig",
     "Glm5NextTextConfig",
+    "Glm5NextVisionConfig",
     "Lfm2Config",
     "Lfm2MoeConfig",
     "Lfm2VlConfig",

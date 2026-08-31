@@ -51,3 +51,9 @@ Torch 2.11 and sglang-kernel 0.4.3 environment; pinned upstream used its native
 Torch 2.13 and sglang-kernel 0.4.6.post1 environment. Cross-loading binary
 kernels is not ABI-compatible. Keep this PR in draft until the remaining
 high-concurrency and long-context rows are resolved or explicitly accepted.
+
+The optional image tower was validated separately with `--enable-multimodal`
+using the same backport dependencies. Three generated solid-color PNGs were
+identified as red, blue, and green, and a text-only request returned `4` for
+`2+2`. The run had no request failures, NaNs, CUDA errors, or worker restarts.
+Video preprocessing remains out of scope.

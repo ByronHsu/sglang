@@ -81,6 +81,39 @@ class TestGlm5NextWeightLoading(unittest.TestCase):
 
         self.assertIn("expert parallelism", reason)
 
+    @patch("sglang.srt.models.glm5_next.DeepseekV2WeightLoaderMixin.post_load_weights")
+    @patch(
+        "sglang.srt.models.glm5_next.vision_utils.pad_vit_attn_dummy_heads",
+        side_effect=lambda config, name, weight: weight,
+    )
+    def test_visual_qkv_weight_is_remapped_and_loaded(self, pad_heads, post_load):
+        qkv_param = _FakeParam()
+        model = SimpleNamespace(
+            config=SimpleNamespace(
+                n_routed_experts=0,
+                num_hidden_layers=45,
+                num_nextn_predict_layers=1,
+            ),
+            encoder_only=False,
+            language_only=False,
+            mm_config=SimpleNamespace(),
+            num_fused_shared_experts=0,
+            quant_config=None,
+            named_parameters=lambda: iter(
+                [("visual.blocks.0.attn.qkv_proj.weight", qkv_param)]
+            ),
+        )
+        loaded_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+        Glm5NextForConditionalGeneration.load_weights(
+            model,
+            [("model.visual.blocks.0.attn.qkv.weight", loaded_weight)],
+        )
+
+        self.assertIs(qkv_param.loaded, loaded_weight)
+        pad_heads.assert_called_once()
+        post_load.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from sglang.srt.batch_overlap.two_batch_overlap import (
     model_forward_maybe_tbo,
@@ -24,6 +25,7 @@ from sglang.srt.eplb.expert_distribution import (
     get_global_expert_distribution_recorder,
 )
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     cp_plain_all_gather,
@@ -35,6 +37,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -68,6 +71,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.layers.utils.cp_utils import (
     can_cp_split,
@@ -81,6 +85,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
 )
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternMultimodalTokens,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
@@ -99,6 +108,15 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Glm5NextMLP
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE as Glm5NextMoE
+from sglang.srt.models.glm_ocr import (
+    GlmOcrRMSNorm,
+    GlmOcrVisionBlock,
+    GlmOcrVisionMLP,
+    GlmOcrVisionModel,
+    GlmOcrVisionPatchEmbed,
+    GlmOcrVisionPatchMerger,
+)
+from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
@@ -111,6 +129,153 @@ from sglang.srt.utils.common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@torch.compile
+def swiglu_clamped(y: torch.Tensor, limit: float):
+    gate, up = torch.chunk(y, 2, dim=-1)
+    gate = torch.clamp(gate, max=limit)
+    up = torch.clamp(up, min=-limit, max=limit)
+    return F.silu(gate) * up
+
+
+class Glm5NextVisionMLP(GlmOcrVisionMLP):
+    def __init__(self, *args, swiglu_limit: float, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.swiglu_limit = swiglu_limit
+
+    def forward(self, x: torch.Tensor):
+        gate_up, _ = self.gate_up_proj(x)
+        x = swiglu_clamped(gate_up, self.swiglu_limit)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class Glm5NextVisionPatchMerger(GlmOcrVisionPatchMerger):
+    def __init__(self, *args, swiglu_limit: float, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.swiglu_limit = swiglu_limit
+
+    def forward(self, x: torch.Tensor):
+        x, _ = self.proj(x)
+        x = self.extra_activation_func(self.post_projection_norm(x))
+        gate_up, _ = self.gate_up_proj(x)
+        x = swiglu_clamped(gate_up, self.swiglu_limit)
+        x, _ = self.down_proj(x)
+        return x
+
+
+class Glm5NextVisionBlock(GlmOcrVisionBlock):
+    def __init__(
+        self,
+        dim: int,
+        intermediate_dim: int,
+        num_heads: int,
+        swiglu_limit: float,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        attn_qkv_bias: bool = True,
+        num_dummy_heads: int = 0,
+        rms_norm_eps: float = 1e-5,
+        use_data_parallel: bool = False,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.norm1 = RMSNorm(dim, eps=rms_norm_eps)
+        self.norm2 = RMSNorm(dim, eps=rms_norm_eps)
+        self.attn = VisionAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            projection_size=dim,
+            use_qkv_parallel=True,
+            qkv_bias=attn_qkv_bias,
+            proj_bias=True,
+            qk_normalization_by_head_size=True,
+            flatten_batch=True,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
+            num_dummy_heads=num_dummy_heads,
+            use_data_parallel=use_data_parallel,
+        )
+        self.mlp = Glm5NextVisionMLP(
+            dim,
+            intermediate_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
+            use_data_parallel=use_data_parallel,
+            swiglu_limit=swiglu_limit,
+        )
+
+
+class Glm5NextVisionModel(GlmOcrVisionModel):
+    def __init__(
+        self,
+        vision_config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        use_data_parallel: bool = False,
+    ) -> None:
+        nn.Module.__init__(self)
+        self.hidden_size = vision_config.hidden_size
+        self.num_heads = vision_config.num_heads
+        self.patch_size = vision_config.patch_size
+        self.spatial_merge_size = vision_config.spatial_merge_size
+        self.out_hidden_size = vision_config.out_hidden_size
+        self.intermediate_size = vision_config.intermediate_size
+        self.use_data_parallel = use_data_parallel
+        self.patch_embed = GlmOcrVisionPatchEmbed(
+            patch_size=vision_config.patch_size,
+            temporal_patch_size=vision_config.temporal_patch_size,
+            in_channels=vision_config.in_channels,
+            hidden_size=self.hidden_size,
+        )
+
+        head_dim = self.hidden_size // self.num_heads
+        self.rotary_pos_emb = get_rope(
+            head_size=head_dim,
+            rotary_dim=head_dim // 2,
+            max_position=8192,
+            base=10000.0,
+            is_neox_style=True,
+        )
+        self.blocks = nn.ModuleList(
+            [
+                Glm5NextVisionBlock(
+                    dim=self.hidden_size,
+                    intermediate_dim=self.intermediate_size,
+                    num_heads=self.num_heads,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"blocks.{layer_idx}", prefix),
+                    rms_norm_eps=vision_config.rms_norm_eps,
+                    attn_qkv_bias=vision_config.attention_bias,
+                    num_dummy_heads=getattr(vision_config, "num_dummy_heads", 0),
+                    use_data_parallel=use_data_parallel,
+                    swiglu_limit=vision_config.swiglu_limit,
+                )
+                for layer_idx in range(vision_config.depth)
+            ]
+        )
+        projection_intermediate_size = getattr(
+            vision_config, "projection_intermediate_size", None
+        )
+        self.merger = Glm5NextVisionPatchMerger(
+            d_model=vision_config.out_hidden_size,
+            context_dim=projection_intermediate_size or vision_config.intermediate_size,
+            quant_config=quant_config,
+            bias=False,
+            prefix=add_prefix("merger", prefix),
+            use_data_parallel=use_data_parallel,
+            swiglu_limit=vision_config.swiglu_limit,
+        )
+        self.downsample = nn.Conv2d(
+            in_channels=vision_config.hidden_size,
+            out_channels=vision_config.out_hidden_size,
+            kernel_size=vision_config.spatial_merge_size,
+            stride=vision_config.spatial_merge_size,
+        )
+        self.post_layernorm = GlmOcrRMSNorm(
+            vision_config.hidden_size, eps=vision_config.rms_norm_eps
+        )
 
 
 class Glm5NextLinearAttention(nn.Module):
@@ -963,8 +1128,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
     ) -> None:
         super().__init__()
         text_config = config.text_config
-        self.encoder_only = False
-        self.language_only = True
+        server_args = get_global_server_args()
+        self.encoder_only = bool(getattr(config, "encoder_only", False))
+        self.language_only = bool(
+            getattr(config, "language_only", False)
+            or server_args.enable_multimodal is not True
+        )
 
         self.fuse_qkv_a_proj = (
             not self.encoder_only
@@ -994,7 +1163,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         text_config.hidden_size,
                         quant_config=quant_config,
                         prefix=add_prefix("lm_head", prefix),
-                        use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                        use_attn_tp_group=server_args.enable_dp_lm_head,
                     )
             else:
                 self.lm_head = PPMissingLayer()
@@ -1032,6 +1201,18 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 getattr(text_config, "q_lora_rank", None),
                 self.use_dsa,
                 text_config.mhc,
+            )
+
+        self.mm_config = config
+        self.use_data_parallel = server_args.mm_enable_dp_encoder
+        self.visual = None
+        if not self.language_only and config.vision_config is not None:
+            vision_utils.update_vit_attn_dummy_heads_config(config)
+            self.visual = Glm5NextVisionModel(
+                config.vision_config,
+                quant_config=quant_config,
+                prefix=add_prefix("visual", prefix),
+                use_data_parallel=self.use_data_parallel,
             )
 
         self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (
@@ -1116,6 +1297,27 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.capture_aux_hidden_states = True
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
+        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(
+            input_ids, mm_inputs
+        )
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        if self.visual is None:
+            raise RuntimeError("GLM-5.3 vision tower is not enabled")
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
+        image_grid_thw = torch.cat([item.image_grid_thw for item in items], dim=0)
+        if self.use_data_parallel:
+            return run_dp_sharded_mrope_vision_model(
+                self.visual,
+                pixel_values,
+                image_grid_thw.tolist(),
+                rope_type="rope_3d",
+            )
+        return self.visual(pixel_values, grid_thw=image_grid_thw)
+
     def _prepare_context_parallel_metadata(
         self,
         input_ids: torch.Tensor,
@@ -1166,13 +1368,23 @@ class Glm5NextForConditionalGeneration(nn.Module):
             input_ids, input_embeds, forward_batch, pp_proxy_tensors
         )
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = self.model(
-                input_ids=input_ids,
-                positions=positions,
-                forward_batch=forward_batch,
-                input_embeds=input_embeds,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
+            if self.visual is None:
+                hidden_states = self.model(
+                    input_ids=input_ids,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    input_embeds=input_embeds,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            else:
+                hidden_states = general_mm_embed_routine(
+                    input_ids=input_ids,
+                    forward_batch=forward_batch,
+                    language_model=self.model,
+                    multimodal_model=self,
+                    positions=positions,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
 
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
@@ -1256,11 +1468,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         weight_names = []
         for name, loaded_weight in weights:
-            if "visual" in name:
+            is_visual_weight = "visual" in name
+            if getattr(self, "encoder_only", False) and not is_visual_weight:
+                continue
+            if getattr(self, "language_only", False) and is_visual_weight:
                 continue
 
             if "language_model." in name:
                 name = name.replace("language_model.", "")
+            if "model.visual." in name:
+                name = name.replace("model.visual.", "visual.")
+            if "visual" in name:
+                name = name.replace("attn.qkv.", "attn.qkv_proj.")
+                loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                    getattr(self, "mm_config", None), name, loaded_weight
+                )
             weight_names.append(name)
 
             if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:

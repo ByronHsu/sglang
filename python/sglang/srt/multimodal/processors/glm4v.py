@@ -16,6 +16,11 @@ try:
 except ImportError:
     GlmOcrForConditionalGeneration = None
 
+try:
+    from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
+except ImportError:
+    Glm5NextForConditionalGeneration = None
+
 
 class Glm4vImageProcessor(SGLangBaseProcessor):
     models = [
@@ -23,6 +28,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         for m in [
             Glm4vForConditionalGeneration,
             Glm4vMoeForConditionalGeneration,
+            Glm5NextForConditionalGeneration,
             GlmOcrForConditionalGeneration,
         ]
         if m is not None
