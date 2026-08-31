@@ -16,16 +16,13 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda
 
 if is_cuda():
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
-
-if is_npu():
-    import custom_ops  # noqa: F401
 
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -1559,10 +1556,7 @@ class IndexerKPool(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        if is_hip():
-            from sglang.srt.layers.attention.dsa.tilelang_kernel import act_quant
-        elif not is_npu():
-            from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
+        from sglang.srt.layers.attention.dsa.triton_kernel import act_quant
 
         if TYPE_CHECKING:
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)

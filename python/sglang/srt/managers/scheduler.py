@@ -1451,7 +1451,7 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         # WAR barrier is CUDA-only; other platforms keep the pre-barrier behavior.
-        self._war_barrier_enabled = is_cuda() and not self.spec_algorithm.is_dflash()
+        self._war_barrier_enabled = is_cuda()
         with self.device_module.StreamContext(self.schedule_stream):
             dispatch_event_loop(self)
 
