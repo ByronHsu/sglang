@@ -9,7 +9,6 @@ from sglang.srt.configs.glm5_next import (
     Glm5NextVisionConfig,
 )
 from sglang.srt.configs.glm5_next_processor import Glm5NextProcessorCompat
-from sglang.srt.configs.mamba_utils import KimiLinearStateShape
 from sglang.srt.configs.model_config import ModelConfig, is_multimodal_model
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.multimodal.customized_mm_processor_utils import (
@@ -123,19 +122,6 @@ class TestGlm5NextTextConfig(CustomTestCase):
         )
 
         self.assertEqual(args.mamba_scheduler_strategy, "no_buffer")
-
-    def test_kimi_linear_state_shape_preserves_channel_slice_axis(self):
-        shape = KimiLinearStateShape.create(
-            tp_world_size=8,
-            num_heads=32,
-            head_dim=96,
-            conv_kernel_size=3,
-        )
-
-        self.assertEqual(shape.conv, [(2, 1152)])
-        self.assertEqual(shape.temporal, (4, 96, 96))
-        self.assertEqual(shape.conv_slice_axis, 1)
-        self.assertEqual(shape.conv_shard_groups, [3072, 3072, 3072])
 
     def test_transformers_format_builds_legacy_linear_attention_config(self):
         config = Glm5NextTextConfig(

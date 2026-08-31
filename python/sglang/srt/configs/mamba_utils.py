@@ -187,17 +187,12 @@ class KimiLinearStateShape:
     conv: List[tuple[int, int]]
     temporal: tuple[int, int, int]
 
-    # KDA stores convolution windows as [K-1, sharded_channels].
-    conv_slice_axis: int = 1
-
     num_heads: int
     head_dim: int
     num_k_heads: int
     head_k_dim: int
     conv_kernel: int
     num_spec: int
-    # Full q/k/v dimensions; each block is TP-sharded independently.
-    conv_shard_groups: Optional[List[int]] = None
 
     @staticmethod
     def create(
@@ -236,7 +231,6 @@ class KimiLinearStateShape:
             head_k_dim=head_k_dim,
             conv_kernel=conv_kernel_size,
             num_spec=num_spec,
-            conv_shard_groups=[proj_size, proj_k_size, proj_k_size],
         )
 
 

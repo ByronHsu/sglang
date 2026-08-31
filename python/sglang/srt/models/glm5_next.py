@@ -118,7 +118,6 @@ from sglang.srt.models.glm_ocr import (
 )
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     BumpAllocator,
     LazyValue,
@@ -575,9 +574,6 @@ class Glm5NextDecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
-            get_global_server_args().speculative_algorithm
-        )
         self.dsa_enable_prefill_cp = dsa_enable_prefill_cp
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
         self.layer_id = layer_id

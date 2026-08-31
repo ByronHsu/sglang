@@ -617,19 +617,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
 
-    def copy_mamba_state(
-        self, src_index: torch.Tensor, dst_index: torch.Tensor
-    ) -> None:
-        if src_index.numel() == 0:
-            return
-        if (
-            self.layer_transfer_counter is not None
-            and self.layer_transfer_counter.consumer_index >= 0
-        ):
-            last_mamba_layer = max(self.mamba_map)
-            self.layer_transfer_counter.wait_until(last_mamba_layer - self.start_layer)
-        self.mamba_pool.copy_from(src_index, dst_index)
-
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
 
@@ -862,12 +849,10 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError()
 
-    def load_cpu_copy(
-        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
-    ):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError()
 
     def maybe_get_custom_mem_pool(self):
@@ -1845,7 +1830,7 @@ class HybridLinearKVPool(KVCache):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
         mamba_cpu = (
             self.mamba_pool.get_cpu_copy(mamba_indices)
@@ -1854,9 +1839,7 @@ class HybridLinearKVPool(KVCache):
         )
         return kv_cpu, mamba_cpu
 
-    def load_cpu_copy(
-        self, cache_cpu, indices, mamba_indices=None, req_pool_index=None
-    ):
+    def load_cpu_copy(self, cache_cpu, indices, mamba_indices=None):
         kv_cpu, mamba_cpu = cache_cpu
         self.full_kv_pool.load_cpu_copy(kv_cpu, indices)
         if mamba_cpu is not None and mamba_indices is not None:
@@ -1875,14 +1858,6 @@ class HybridLinearKVPool(KVCache):
         assert self.use_mla, "set_mla_kv_buffer called when use_mla is False"
         with self._transfer_id_context(layer):
             self.full_kv_pool.set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
-
-    def prefetch_full_attention_kv_buffer(self, layer_id: int) -> None:
-        if not self.use_mla or not hasattr(self.full_kv_pool, "prefetch_kv_buffer"):
-            return
-        if layer_id not in self.full_attention_layer_id_mapping:
-            return
-        full_layer_id = self._transfer_full_attention_id(layer_id)
-        self.full_kv_pool.prefetch_kv_buffer(full_layer_id)
 
     def get_mla_kv_buffer(
         self,
@@ -2261,7 +2236,7 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
-    def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -2278,9 +2253,7 @@ class MLATokenToKVPool(KVCache):
         current_platform.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(
-        self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
-    ):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
