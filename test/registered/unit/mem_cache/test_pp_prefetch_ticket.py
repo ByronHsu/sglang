@@ -18,8 +18,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -188,6 +190,43 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertTrue(result.operation.assume_stored)
         self.assertIs(c.prefetch_queue.get_nowait(), result.operation)
         c._storage_hit_query.assert_not_called()
+
+    def test_ticket_uses_a_checkpoint_shared_by_all_queried_stages(self):
+        """The shortest stage maximum need not exist on another PP stage."""
+        c = self.c
+        del c._storage_hit_query
+        c.storage_backend = Mock()
+        transfer = PoolTransfer(
+            PoolName.MAMBA,
+            keys=["__placeholder__"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+        for first, second, expected in (
+            ([1, 4], [1, 3], 4),
+            ([2, 4], [1, 3], 0),
+            ([1, 4], [1, 4], 16),
+            ([1, 4], [], 0),
+        ):
+            with self.subTest(first=first, second=second):
+                c.pp_prefetch_command_queue = Queue()
+                c.storage_backend.batch_exists_v2.side_effect = [
+                    PoolTransferResult(max(pages, default=0), {}, pages)
+                    for pages in (first, second)
+                ]
+                submission = c.submit_prefetch(
+                    CacheRequestHandle(f"{first}:{second}", 0),
+                    RadixKey(list(range(16))),
+                    None,
+                    None,
+                    [],
+                    [transfer],
+                )
+                self.assertEqual(submission.decision, bool(expected))
+                if expected:
+                    ticket = c.pp_prefetch_command_queue.get_nowait()
+                    self.assertEqual(ticket.storage_hit_count, expected)
+                else:
+                    self.assertTrue(c.pp_prefetch_command_queue.empty())
 
     def test_downstream_request_and_ticket_order_preserves_pp0_admission(self):
         c, cache = self.c, self.cache
