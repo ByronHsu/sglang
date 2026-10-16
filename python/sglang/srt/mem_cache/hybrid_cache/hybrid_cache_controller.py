@@ -1098,9 +1098,9 @@ class HybridCacheController(BaseHiCacheController):
             for group in self.prefetch_hits_sync_groups
             if set(torch.distributed.get_process_group_ranks(group)) != pp_group_ranks
         ]
-        hit_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
-        self._all_reduce(hit_tensor, torch.distributed.ReduceOp.MIN, local_groups)
-        storage_hit_count = int(hit_tensor.item())
+        storage_hit_count = self._sync_prefetch_hit_query(
+            operation, storage_hit_count, sync_groups=local_groups
+        )
         storage_hit_count -= storage_hit_count % self.page_size
         if storage_hit_count < self.prefetch_threshold:
             with self.pp_prefetch_state_lock:
@@ -1379,9 +1379,17 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
-        operation.pool_storage_result.restorable_prefix_pages = (
-            hit_result.restorable_prefix_pages
-        )
+        restorable = hit_result.restorable_prefix_pages
+        if pp_rank is not None:
+            previous = operation.pool_storage_result.restorable_prefix_pages
+            if previous is not None:
+                # One TP rank can query multiple PP stages before the vote.
+                restorable = (
+                    previous
+                    if restorable is None
+                    else sorted(set(previous).intersection(restorable))
+                )
+        operation.pool_storage_result.restorable_prefix_pages = restorable
         # Each pool's own boundary (the KV pool's where the backend reports
         # it, else the folded cut); the beliefs heal pool by pool. A pool the
         # backend did not report carries no verdict.
@@ -1398,7 +1406,9 @@ class HybridCacheController(BaseHiCacheController):
             kv_hit_pages * self.page_size,
         )
 
-    def _sync_prefetch_hit_query(self, operation, storage_hit_count: int) -> int:
+    def _sync_prefetch_hit_query(
+        self, operation, storage_hit_count: int, sync_groups=None
+    ) -> int:
         """One MIN collective for the folded hit count and every pool's own
         boundary, so per-pool beliefs stay rank-identical. A pool omitted
         by any rank heals from the folded cut without learning presence."""
@@ -1420,7 +1430,8 @@ class HybridCacheController(BaseHiCacheController):
                     # contiguous-prefix contract. File and Mooncake return a set.
                     pages = range(1, storage_hit_count // self.page_size + 1)
                 for page in pages:
-                    hits[page] = 1
+                    if 0 < page <= storage_hit_count // self.page_size:
+                        hits[page] = 1
         else:
             hits = [storage_hit_count]
         pools = list(PoolName)
@@ -1432,7 +1443,7 @@ class HybridCacheController(BaseHiCacheController):
         self._all_reduce(
             packed,
             torch.distributed.ReduceOp.MIN,
-            self.prefetch_hits_sync_groups,
+            self.prefetch_hits_sync_groups if sync_groups is None else sync_groups,
         )
         reduced = packed.tolist()
         operation.query_pool_hit_pages = {
